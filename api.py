@@ -116,6 +116,22 @@ def _run_search(run_id: str, job_title: str, region: str) -> None:
         )
 
 
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    # Render's default health check probes "/" unless a service is
+    # configured (via render.yaml or the dashboard) to use a specific
+    # path. Without this route, that probe - and every bot that scans
+    # the bare URL - gets a 404, which is noisy and can make an
+    # otherwise-healthy service look broken. This just points anyone
+    # landing here at the real endpoints; it duplicates no pipeline logic.
+    return {
+        "service": "Remote AI Job Search Engine API",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
+
+
 @app.get("/api/health")
 def health():
     # allowed_origins is echoed back so a CORS misconfiguration can be

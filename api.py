@@ -118,7 +118,15 @@ def _run_search(run_id: str, job_title: str, region: str) -> None:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "regions": VALID_REGIONS}
+    # allowed_origins is echoed back so a CORS misconfiguration can be
+    # diagnosed by opening this URL in a browser - no Render dashboard
+    # access needed. These are frontend URLs, not secrets, so exposing
+    # the list here is safe.
+    return {
+        "status": "ok",
+        "regions": VALID_REGIONS,
+        "allowed_origins": allowed_origins,
+    }
 
 
 @app.get("/api/regions")

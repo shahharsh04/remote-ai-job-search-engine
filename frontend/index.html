@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remote AI Job Search Engine</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="header">
+      <h1>Remote AI Job Search Engine</h1>
+      <p class="subtitle">
+        Search Indeed, LinkedIn and Google Jobs for remote roles, then export a
+        company-level lead list to Excel.
+      </p>
+    </header>
+
+    <section class="card" aria-labelledby="search-heading">
+      <h2 id="search-heading" class="card-title">New search</h2>
+
+      <form id="search-form" novalidate>
+        <div class="field">
+          <label for="job-title">Job title</label>
+          <input
+            type="text"
+            id="job-title"
+            name="job-title"
+            placeholder="e.g. AI Engineer"
+            autocomplete="off"
+            required
+          />
+        </div>
+
+        <fieldset class="field">
+          <legend>Location</legend>
+          <div class="regions" id="regions" role="radiogroup" aria-label="Location">
+            <!-- Regions are loaded from the API so the list is never
+                 duplicated here. Static fallback if the API is unreachable. -->
+          </div>
+        </fieldset>
+
+        <button type="submit" id="start-button" class="button-primary">
+          Start job search
+        </button>
+        <p class="hint">
+          A full run takes several minutes. You can leave this page open while it works.
+        </p>
+      </form>
+    </section>
+
+    <section
+      class="card status-card"
+      id="status-card"
+      aria-live="polite"
+      aria-atomic="true"
+      hidden
+    >
+      <div class="status-row">
+        <span class="spinner" id="spinner" hidden></span>
+        <div>
+          <p class="status-title" id="status-title">Starting…</p>
+          <p class="status-detail" id="status-detail"></p>
+        </div>
+      </div>
+
+      <div class="results" id="results" hidden>
+        <div class="stat">
+          <span class="stat-value" id="stat-jobs">—</span>
+          <span class="stat-label">Jobs found</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-companies">—</span>
+          <span class="stat-label">Qualified companies</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-leads">—</span>
+          <span class="stat-label">Leads selected</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-contacts">—</span>
+          <span class="stat-label">Contacts found</span>
+        </div>
+      </div>
+
+      <button type="button" id="download-button" class="button-primary" hidden>
+        Download Excel file
+      </button>
+    </section>
+
+    <footer class="footer">
+      <span id="api-target" class="api-target"></span>
+    </footer>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

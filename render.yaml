@@ -1,0 +1,22 @@
+# Render blueprint for the backend API.
+#
+# IMPORTANT: numInstances and workers are both 1 on purpose. Run state
+# (which search is running, and where its .xlsx landed) lives in memory
+# in api.py. A second worker or instance would not see runs started by
+# the first, so polling would return "Unknown run id" at random.
+services:
+  - type: web
+    name: remote-job-search-api
+    runtime: python
+    plan: starter          # free tier sleeps; see README notes
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.4
+      - key: ALLOWED_ORIGINS
+        sync: false        # set in the dashboard to your Netlify URL
+      - key: CONFIG_PATH
+        value: config.yaml

@@ -1,0 +1,10 @@
+python-jobspy
+pandas
+openpyxl
+pyyaml
+
+# HTTP API layer (api.py) - only needed when serving the frontend.
+# The CLI (python main.py) does not require these.
+fastapi
+uvicorn[standard]
+requests

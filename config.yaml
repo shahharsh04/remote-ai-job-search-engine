@@ -1,0 +1,110 @@
+# =============================================================================
+# Remote AI Job Search Engine - Configuration
+# These are the settings that stay the same across searches. The job
+# title and the region (USA / UK / Australia / Europe) are chosen
+# interactively each time you run `python main.py` - you don't need to
+# edit this file to run a new search.
+# =============================================================================
+
+# Job platforms to search every time.
+platforms: ["indeed", "linkedin", "google"]
+
+# Only consider postings from the last N hours (168 = 7 days).
+hours_old: 168
+
+# How many results to request per platform before deduplication/capping.
+# Fetching generously here means the target below is more likely to be
+# reached after duplicates are removed.
+results_wanted_per_platform: 50
+
+# How many pages to page through per platform (via JobSpy's `offset`).
+# Raising this collects more jobs when a platform has them; it does not
+# invent jobs when a platform has run out.
+max_pages_per_platform: 3
+
+# Maximum number of rows in the final Excel file. If fewer genuine
+# remote postings exist after filtering, the output will have fewer
+# rows rather than being padded.
+target_total_jobs: 50
+
+# Folder where the output .xlsx file is written.
+output_dir: "./output"
+
+
+# How much evidence a posting needs before it counts as remote.
+#   balanced (default) - trust the platform's server-side remote filter
+#                        for rows whose wording says nothing either way.
+#                        More jobs; a few may need spot-checking.
+#   strict             - only keep rows with positive remote evidence
+#                        (platform flag, or "remote"/"work from home"
+#                        wording). Fewer jobs, higher confidence.
+remote_strictness: "balanced"
+
+
+# =============================================================================
+# Lead-generation pipeline
+# =============================================================================
+# Everything the lead stages use lives here - no threshold is hard-coded
+# in the stage logic, so the pipeline can be retuned without touching
+# any .py file.
+lead_pipeline:
+
+  # ---- Company size bands (employees) --------------------------------
+  # Preferred ICP: 20-500. Medium priority: 500-5,000. Low: 5,000+.
+  preferred_min_employees: 20
+  preferred_max_employees: 500
+  medium_priority_employee_threshold: 500
+  low_priority_employee_threshold: 5000
+
+  # ---- Final lead list ------------------------------------------------
+  # If fewer than min_final_leads qualify, the run reports the shortfall
+  # rather than padding the list.
+  max_final_leads: 15
+  min_final_leads: 10
+
+  # ---- Exclusions -----------------------------------------------------
+  # Company types whose primary business competes with an AI
+  # engineering/services offering. Delete an entry to stop excluding it.
+  # Large organisations are deliberately NOT here: they stay in the
+  # dataset and simply score lower.
+  excluded_company_types:
+    - staffing_agency
+    - recruitment_agency
+    - it_services
+    - ai_ml_consulting
+    - software_outsourcing
+
+  # Write excluded companies to their own CSV for audit.
+  save_excluded_companies: true
+
+  # ---- Contact enrichment ---------------------------------------------
+  contact_enrichment:
+    # Fetch the company's own public careers page over plain HTTP.
+    # Turn off to keep the run offline apart from the job boards.
+    enable_careers_page_lookup: true
+    respect_robots_txt: true
+    request_timeout_seconds: 8
+    # Enrichment makes network calls, so it is budgeted per run.
+    max_companies_to_enrich: 20
+    # LinkedIn *search* links for recruiter titles. These are research
+    # links, never claimed profiles - profiles cannot be read without
+    # scraping behind a login, which this project does not do.
+    generate_linkedin_search_urls: true
+    user_agent: "RemoteJobSearchEngine/1.0 (lead research)"
+
+  # ---- Prioritisation scoring -----------------------------------------
+  scoring:
+    # Points per factor. Raise a weight to make that factor matter more;
+    # the total is normalised to 0-100 regardless of the weights chosen.
+    weights:
+      icp_fit: 30
+      hiring_signal: 25
+      contact_found: 15
+      multiple_openings: 10
+      funding_signal: 10
+      new_ai_initiative: 10
+
+    # Normalised score needed for each priority band.
+    priority_bands:
+      high_min_score: 70
+      medium_min_score: 45

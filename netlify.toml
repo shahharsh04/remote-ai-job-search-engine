@@ -1,0 +1,41 @@
+# Netlify deploys the STATIC FRONTEND ONLY.
+#
+# The Python backend (api.py) cannot run here: a pipeline run takes
+# ~4 minutes, well past the 26s Netlify Functions limit, and the run
+# state plus generated .xlsx live on a real filesystem. Host it on
+# Render/Railway/Fly.io and put its public URL in VITE_API_BASE_URL.
+
+[build]
+  publish = "frontend"
+  # There is no bundler in this project - the frontend is plain HTML/CSS/JS,
+  # so there is nothing to compile. This step only injects the backend URL
+  # into config.js so no URL is ever hardcoded in the deployed site.
+  # VITE_API_BASE_URL is the primary name; API_BASE_URL is accepted too.
+  command = """
+    URL="${VITE_API_BASE_URL:-$API_BASE_URL}"
+    if [ -z "$URL" ]; then
+      echo 'ERROR: VITE_API_BASE_URL is not set.' >&2
+      echo 'Set it under Site settings -> Environment variables, then redeploy.' >&2
+      exit 1
+    fi
+    case "$URL" in
+      http://localhost*|http://127.0.0.1*)
+        echo "ERROR: VITE_API_BASE_URL points at localhost ($URL)." >&2
+        echo 'A deployed site cannot reach your machine. Use the public backend URL.' >&2
+        exit 1 ;;
+    esac
+    printf 'window.APP_CONFIG = { API_BASE_URL: "%s" };\n' "$URL" > frontend/config.js
+    echo "config.js written for $URL"
+  """
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+[[headers]]
+  for = "/config.js"
+  [headers.values]
+    Cache-Control = "no-store"

@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated output - results are re-runnable, don't commit them
+output/*.xlsx
+output/*.csv
+~$*.xlsx
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Environment files - never commit these
+.env
+.env.*
+!.env.example

@@ -32,6 +32,7 @@ import company_identity
 import contacts
 import icp
 import lead_signals
+import excluded_company_store
 
 log = logging.getLogger("job_search")
 
@@ -50,12 +51,15 @@ LEAD_CONFIG_DEFAULTS = {
     "medium_priority_employee_threshold": 500,
     "low_priority_employee_threshold": 5000,
 
-    # Size of the final lead list.
-    "max_final_leads": 15,
-    "min_final_leads": 10,
+    # Target size of the final qualified-lead list. The search can
+    # expand to additional locations until this number is reached.
+    "target_leads": 50,
+    "max_final_leads": 50,
+    "min_final_leads": 50,
 
     # Keep companies removed by ICP filtering in their own file.
     "save_excluded_companies": True,
+    "excluded_company_dictionary_path": "data/excluded_companies.json",
 
     # Company types whose primary business competes with an AI
     # engineering/services offering. Remove an entry to stop excluding
@@ -67,6 +71,7 @@ LEAD_CONFIG_DEFAULTS = {
         "it_services",
         "ai_ml_consulting",
         "software_outsourcing",
+        "bpo_services",
     ],
 
     "contact_enrichment": {
@@ -154,7 +159,7 @@ def load_lead_config(config: dict) -> dict:
     for key in (
         "preferred_min_employees", "preferred_max_employees",
         "medium_priority_employee_threshold", "low_priority_employee_threshold",
-        "max_final_leads", "min_final_leads",
+        "target_leads", "max_final_leads", "min_final_leads",
     ):
         value = lead_config[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -166,6 +171,10 @@ def load_lead_config(config: dict) -> dict:
             f"save_excluded_companies={lead_config['save_excluded_companies']!r} is not true/false"
         )
         lead_config["save_excluded_companies"] = LEAD_CONFIG_DEFAULTS["save_excluded_companies"]
+
+    if not isinstance(lead_config["excluded_company_dictionary_path"], str) or not lead_config["excluded_company_dictionary_path"].strip():
+        problems.append("excluded_company_dictionary_path must be a non-empty string")
+        lead_config["excluded_company_dictionary_path"] = LEAD_CONFIG_DEFAULTS["excluded_company_dictionary_path"]
 
     if not isinstance(lead_config["excluded_company_types"], list):
         problems.append("excluded_company_types is not a list")
@@ -191,13 +200,14 @@ def load_lead_config(config: dict) -> dict:
         lead_config["low_priority_employee_threshold"] = \
             LEAD_CONFIG_DEFAULTS["low_priority_employee_threshold"]
 
-    if lead_config["min_final_leads"] > lead_config["max_final_leads"]:
-        problems.append(
-            f"min_final_leads ({lead_config['min_final_leads']}) is above "
-            f"max_final_leads ({lead_config['max_final_leads']})"
-        )
-        lead_config["min_final_leads"] = LEAD_CONFIG_DEFAULTS["min_final_leads"]
-        lead_config["max_final_leads"] = LEAD_CONFIG_DEFAULTS["max_final_leads"]
+    # `target_leads` is the business target. Keep the legacy max/min
+    # settings synchronized so older callers remain compatible.
+    if lead_config["target_leads"] <= 0:
+        problems.append("target_leads must be greater than zero")
+        lead_config["target_leads"] = LEAD_CONFIG_DEFAULTS["target_leads"]
+
+    lead_config["max_final_leads"] = lead_config["target_leads"]
+    lead_config["min_final_leads"] = lead_config["target_leads"]
 
     bands = lead_config["scoring"]["priority_bands"]
     if bands.get("medium_min_score", 0) > bands.get("high_min_score", 0):
@@ -301,7 +311,7 @@ class JobCollectionStage(Stage):
     search, so the current job-search behaviour is unchanged."""
 
     name = "Job Collection"
-    description = "Search Indeed/LinkedIn/Google across the selected region, with fallback"
+    description = "Search configured job platforms across the selected region, with dynamic fallback"
 
     def __init__(self, collect_fn, dedupe_fn):
         self.collect_fn = collect_fn
@@ -418,6 +428,9 @@ COMPANY_FIRST_VALUE_COLUMNS = [
     "company_url", "company_url_direct", "company_industry",
     "company_num_employees", "company_revenue", "company_addresses",
     "company_description", "country", "_region",
+    # The title the user searched for. Identical on every row of a run;
+    # carried through so the lead sheet can state what was searched.
+    "original_job_title",
 ]
 
 COMPANY_JOINED_COLUMNS = {
@@ -587,8 +600,53 @@ class IcpFilteringStage(Stage):
             return ctx.data
 
         df = ctx.data.copy()
-        verdicts = [icp.evaluate_company(row, ctx.lead_config)
-                    for row in df.to_dict("records")]
+        dictionary_path = ctx.lead_config.get("excluded_company_dictionary_path", "data/excluded_companies.json")
+        known_companies = excluded_company_store.all_companies(dictionary_path)
+        known_keys = set()
+        for item in known_companies:
+            for field in ("company_domain", "company_name"):
+                value = str(item.get(field) or "").strip().lower()
+                if value:
+                    known_keys.add(f"{field}:{value}")
+
+        verdicts = []
+        persistent_matches = []
+        for row in df.to_dict("records"):
+            identity_record = {
+                "company_name": row.get("company_name") or row.get("company"),
+                "company_domain": row.get("_company_domain") or row.get("company_domain"),
+            }
+            identity_keys = set()
+            for field in ("company_domain", "company_name"):
+                value = str(identity_record.get(field) or "").strip().lower()
+                if value:
+                    identity_keys.add(f"{field}:{value}")
+
+            if identity_keys.intersection(known_keys):
+                match = next((x for x in known_companies
+                              if identity_keys.intersection({
+                                  f"company_domain:{str(x.get('company_domain') or '').strip().lower()}",
+                                  f"company_name:{str(x.get('company_name') or '').strip().lower()}"
+                              })), None)
+                known_category = (match or {}).get("category", "Known excluded company")
+                known_reason = (match or {}).get("reason", "Previously identified as a low-probability buyer.")
+                verdicts.append({
+                    "employee_count": icp.parse_employee_count(row.get("company_num_employees"))[0],
+                    "employee_count_estimate": icp.parse_employee_count(row.get("company_num_employees"))[1],
+                    "company_size": icp.size_band(icp.parse_employee_count(row.get("company_num_employees"))[1], ctx.lead_config),
+                    "company_type": known_category,
+                    "company_type_evidence": "persistent exclusion dictionary",
+                    "icp_status": "Excluded",
+                    "exclusion_reason": known_reason,
+                })
+                persistent_matches.append({
+                    "company_name": identity_record["company_name"] or "Unknown company",
+                    "company_domain": identity_record["company_domain"] or "",
+                    "company_type": known_category,
+                    "exclusion_reason": known_reason,
+                })
+            else:
+                verdicts.append(icp.evaluate_company(row, ctx.lead_config))
         for field in ("employee_count", "employee_count_estimate", "company_size",
                       "company_type", "company_type_evidence", "icp_status",
                       "exclusion_reason"):
@@ -598,9 +656,51 @@ class IcpFilteringStage(Stage):
         excluded = df[excluded_mask]
         kept = df[~excluded_mask]
 
+        # Persist every excluded company across runs. This turns the dictionary
+        # into a cumulative memory: Run 2 can immediately reject a company
+        # already identified in Run 1.
+        if not excluded.empty and ctx.lead_config.get("save_excluded_companies", True):
+            for record in excluded.to_dict("records"):
+                excluded_company_store.add(
+                    record,
+                    str(record.get("company_type") or "Unknown"),
+                    str(record.get("exclusion_reason") or "Excluded by ICP rules."),
+                    dictionary_path,
+                )
+
+        if persistent_matches:
+            ctx.add_artifact("persistent_dictionary_matches", persistent_matches)
+
         if not excluded.empty:
             ctx.append_excluded(excluded, self.name, "excluded by ICP rules")
             log.info(f"      excluded {len(excluded)} competitor companies")
+
+            # Keep a compact, reviewable company-level watchlist for the
+            # UI. This is separate from the reusable rule dictionary in
+            # icp.py, so users can see both the rules and the actual
+            # companies removed in the current run.
+            excluded_rows = []
+            for record in excluded.to_dict("records"):
+                excluded_rows.append({
+                    "company_name": record.get("company_name", ""),
+                    "company_domain": record.get("company_domain", ""),
+                    "company_type": record.get("company_type", "Unknown"),
+                    "exclusion_reason": record.get("exclusion_reason", ""),
+                })
+            existing_watchlist = ctx.artifacts.get("persistent_dictionary_matches", [])
+            combined = existing_watchlist + excluded_rows
+            seen = set()
+            deduped_watchlist = []
+            for item in combined:
+                key = (str(item.get("company_domain") or "").lower(), str(item.get("company_name") or "").lower())
+                if key not in seen:
+                    seen.add(key)
+                    deduped_watchlist.append(item)
+            ctx.add_artifact("excluded_company_watchlist", deduped_watchlist)
+        else:
+            ctx.add_artifact("excluded_company_watchlist", ctx.artifacts.get("persistent_dictionary_matches", []))
+
+        ctx.add_artifact("persistent_excluded_companies", excluded_company_store.all_companies(dictionary_path))
 
         unknown_size = int((kept["company_size"] == icp.UNKNOWN).sum())
         if unknown_size:

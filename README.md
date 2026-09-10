@@ -1,9 +1,11 @@
 # Remote AI Job Search Engine
 
 A Python command-line tool that asks you for a **job title**, a **region** (USA, UK, Australia
-or Europe) and confirms **Remote only**, then searches **Indeed, LinkedIn and Google Jobs**,
-removes duplicate postings, filters out anything that isn't genuinely remote, and exports the
-results to a single **Excel (.xlsx)** file.
+or Europe) and confirms **Remote only**, then searches **Indeed and LinkedIn plus four
+dedicated remote-only job boards — RemoteOK, Remotive, We Work Remotely and Jobspresso** (see
+§7b), also expanding your title into closely-related keywords (see §7a), removes duplicate
+postings, filters out anything that isn't genuinely remote, and exports the results to a
+single **Excel (.xlsx)** file.
 
 If your chosen region doesn't have enough remote jobs, the remaining regions are searched
 automatically as a fallback until the target count is met — with your selected region's jobs
@@ -23,6 +25,8 @@ There is no website, no database, no login and no chatbot.
 5. [Folder structure](#5-folder-structure)
 6. [Installation](#6-installation)
 7. [Configuration (`config.yaml`)](#7-configuration-configyaml)
+7a. [Similar-title keyword expansion](#7a-similar-title-keyword-expansion-keyword_expansion)
+7b. [Job platforms](#7b-job-platforms-job_sourcespy)
 8. [How to run](#8-how-to-run)
 9. [Excel output columns](#9-excel-output-columns)
 10. [Implementation steps](#10-implementation-steps)
@@ -53,7 +57,8 @@ run a new search.
 - A Python script (`main.py`) plus a settings file (`config.yaml`), run manually from the command line.
 - Three interactive inputs: job title, region (USA / UK / Australia / Europe), remote-only confirmation.
 - Automatic fallback to the other regions when the selected one comes up short, selected region first in the output.
-- Job discovery on Indeed, LinkedIn and Google Jobs, using free / open-source tools only.
+- Job discovery on Indeed and LinkedIn (via JobSpy) plus RemoteOK, Remotive, We Work Remotely
+  and Jobspresso (via `job_sources.py`), using only public APIs/RSS feeds — see §7b.
 - **Remote-only** filtering — zero on-site or hybrid rows in the final output.
 - Duplicate removal across platforms.
 - A clean, fixed-column Excel export plus a console run summary.
@@ -93,14 +98,30 @@ run a new search.
       ("Europe" is not a searchable value on any of these job boards)
                             |
                             v
+[2b] Expand the job title into similar keywords          (keywords.py)
+      "AI Engineer" -> also "Machine Learning Engineer", "ML Engineer",
+                       "Artificial Intelligence Engineer", "AI/ML Engineer", ...
+      the title you typed is ALWAYS keyword #1 and is never rewritten;
+      every added keyword is validated for relatedness before it is searched
+      (see §7a). Set keyword_expansion.enabled: false to switch this off.
+                            |
+                            v
 [3] Search the SELECTED region first
-      each country x each platform: indeed -> linkedin -> google
-      is_remote=True always sent; paginated via offset up to
-      max_pages_per_platform, stopping early when a platform repeats rows
+      each country x each KEYWORD x each platform:
+        indeed -> linkedin -> remoteok -> remotive -> weworkremotely -> jobspresso
+      keywords are searched primary-first, and the keyword loop stops
+      early once the target is met - so extra keywords cost nothing
+      when the primary title already fills the file
+      Indeed/LinkedIn: is_remote=True always sent; paginated via offset up
+      to max_pages_per_platform, stopping early when a platform repeats rows
+      RemoteOK/Remotive/WWR/Jobspresso: dedicated remote-only boards, each
+      reached through its own public API or RSS feed (see §7b) - fetched
+      once per run and filtered by keyword + required-location, not paginated
       NOTE: hours_old is NOT sent to Indeed - doing so silently cancels
       Indeed's remote filter (see §14), so the date cut-off is applied
-      locally to Indeed rows instead
-      EACH call wrapped in try/except: a failure is logged, the run continues
+      locally to Indeed rows instead (and to every §7b platform, which has
+      no hours_old parameter of its own to send)
+      EACH platform call wrapped in try/except: a failure is logged, the run continues
                             |
                             v
 [4] Filter + dedupe what the selected region returned, then check the count
@@ -124,7 +145,7 @@ run a new search.
       selected one and the selected region stays at the top of the sheet
                             |
                             v
-[7] Cap to target_total_jobs, reorder to the fixed 17-column schema,
+[7] Cap to target_total_jobs, reorder to the fixed 18-column schema,
     add date_fetched, truncate over-long descriptions
                             |
                             v
@@ -143,8 +164,9 @@ run a new search.
 | Purpose | Choice | Why |
 |---|---|---|
 | Language | Python 3.10+ (tested on 3.11) | Required baseline |
-| Job discovery | **JobSpy** (`python-jobspy`) | MIT-licensed, actively maintained; one function call covers Indeed, LinkedIn and Google Jobs; returns a pandas DataFrame; has a built-in `is_remote` filter |
-| Data handling | **pandas** | JobSpy already returns a DataFrame; dedup and column ordering are one-liners |
+| Job discovery (Indeed/LinkedIn) | **JobSpy** (`python-jobspy`) | MIT-licensed, actively maintained; returns a pandas DataFrame; has a built-in `is_remote` filter |
+| Job discovery (remote boards) | **`job_sources.py`** (this project) + **`requests`** | RemoteOK/Remotive public JSON APIs and We Work Remotely/Jobspresso public RSS feeds — see §7b for why these four and not Google Jobs |
+| Data handling | **pandas** | Both discovery paths return/are normalised to a DataFrame; dedup and column ordering are one-liners |
 | Excel writing | **openpyxl** | The engine pandas uses for `.to_excel()` |
 | Settings file | **PyYAML** | YAML is human-editable, so a non-engineer can change settings without touching code |
 
@@ -210,7 +232,7 @@ You do **not** need to edit this file to run a search — the job title and loca
 the prompt. This file only holds the settings that stay the same between searches.
 
 ```yaml
-platforms: ["indeed", "linkedin", "google"]
+platforms: ["indeed", "linkedin", "remoteok", "remotive", "weworkremotely", "jobspresso"]
 hours_old: 168
 results_wanted_per_platform: 50
 max_pages_per_platform: 3
@@ -221,7 +243,7 @@ remote_strictness: "balanced"
 
 | Key | Meaning |
 |---|---|
-| `platforms` | Which job boards to search. Default: Indeed, LinkedIn, Google Jobs. |
+| `platforms` | Which job boards to search. Default: Indeed, LinkedIn (via JobSpy) plus RemoteOK, Remotive, We Work Remotely and Jobspresso (via `job_sources.py` — see §7b). Google Jobs is not included — see §7b. |
 | `hours_old` | Only include postings newer than this many hours (168 = 7 days). |
 | `results_wanted_per_platform` | How many results to request per platform before filtering. Fetch generously — duplicates and non-remote rows get removed afterwards. |
 | `max_pages_per_platform` | How many pages to request per platform via JobSpy's `offset`. Collects more when a platform has more; stops early once a platform starts repeating rows. |
@@ -231,6 +253,159 @@ remote_strictness: "balanced"
 
 If `config.yaml` is missing or empty the script warns and uses these same values as built-in
 defaults, so it always stays runnable.
+
+## 7a. Similar-title keyword expansion (`keyword_expansion`)
+
+A search for `AI Engineer` misses a company that advertises the same job as
+`Machine Learning Engineer`. Expansion fixes that: the title you type is searched **plus** the
+titles recruiters use for the same role, across every platform in `platforms`.
+
+```
+AI Engineer  ->  AI Engineer                        (primary - exactly what you typed)
+                 Artificial Intelligence Engineer
+                 Machine Learning Engineer
+                 Applied AI Engineer
+                 ML Engineer
+                 AI/ML Engineer
+```
+
+Three guarantees:
+
+1. **The original wins.** Your title is always keyword #1, searched first. Deduplication keeps
+   the first occurrence, so a job found by both your title and a similar one is credited to
+   yours. Nothing you typed is ever rewritten or dropped.
+2. **Nothing unrelated gets in.** Every candidate is validated before any platform is called:
+   it must name the same *kind* of role (an engineering search never pulls in `Data Analyst`
+   or `Product Manager`), must not be a broad catch-all (`Engineer`, `Data`, `Machine
+   Learning` on their own are blocked), must be 2–6 words, and must either belong to the same
+   curated title family or share a subject word with your title. Rejects are counted and
+   printed in the run summary with the reason.
+3. **No invented jobs.** Expansion produces *search terms* only. The job boards remain the
+   sole source of postings.
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `false` searches exactly the title you typed, i.e. the pre-expansion behaviour. |
+| `max_keywords` | Total keywords per run **including** your own title. Each extra keyword is another pass over every platform, so this is the main cost/coverage dial. It is a ceiling, not a fixed cost — the keyword loop stops as soon as `target_total_jobs` is met. |
+| `role_noun_synonyms` | Generate `Engineer` ↔ `Developer` variants. |
+| `abbreviation_variants` | Generate the opposite spelling of an abbreviation (`AI Engineer` ↔ `Artificial Intelligence Engineer`). Boards index the two differently, so both are worth searching. |
+| `preserve_seniority` | Carry `Senior`/`Lead` from your title onto generated keywords. Off by default — boards match seniority loosely and it narrows results sharply. |
+| `extra_synonyms` | `{"your title": ["extra keyword", ...]}` — force in a term the built-in tables lack. Trusted: shape-checked only. |
+| `blocked_terms` | Extra terms to reject, added to the built-in broad-term list. |
+| `ai.enabled` | Optionally ask a model for more titles. **Off by default**; the built-in tables need no API key and no network call. |
+
+### Adding your own titles
+
+The curated families live in `ROLE_FAMILIES` in [`keywords.py`](keywords.py) — one list per
+role, each entry a title a recruiter would use for the *same* job. Add a title to a family, or
+a whole new family, and every member becomes reachable from every other. For a one-off, use
+`extra_synonyms` in `config.yaml` instead and leave the code alone.
+
+### Using AI for keywords
+
+Set `keyword_expansion.ai.enabled: true`, `pip install anthropic`, and export
+`ANTHROPIC_API_KEY`. The model is asked for job **titles** only — never for job listings — and
+everything it returns goes through the same validation as every other keyword, so a
+hallucinated or off-topic title is rejected before any platform is searched. If the call fails
+or the key is missing, the run logs a warning and continues on the built-in tables.
+
+### Reusing the expander
+
+`keywords.py` has no dependency on the rest of the project:
+
+```python
+from keywords import KeywordExpander, expand_job_title
+
+expand_job_title("Data Scientist")["keywords"]
+KeywordExpander(my_settings).expand("Backend Engineer")   # per-search settings
+```
+
+`expand()` returns the keywords, the rejected candidates with reasons, the matched family, and
+where each keyword came from.
+
+---
+
+## 7b. Job platforms (`job_sources.py`)
+
+Indeed and LinkedIn are searched through **JobSpy**, unchanged. **Google Jobs has been
+removed** — live searches kept returning results with no clear connection to the query,
+Google's own remote flag is a text guess it derives itself rather than a real filter (see
+§14), and JobSpy's Google scraper has no server-side keyword search of its own. In its place,
+four dedicated **remote-only** job boards are searched, each through a source it actually
+publishes for reuse — never a scrape of a page meant for browsers, and never a site whose
+terms or `robots.txt` say no:
+
+| Platform | Access method | Type |
+|---|---|---|
+| **RemoteOK** | [`remoteok.com/api`](https://remoteok.com/api) | Public JSON API, no key |
+| **Remotive** | [`remotive.com/api/remote-jobs`](https://remotive.com/api/remote-jobs) | Public JSON API, no key |
+| **We Work Remotely** | per-category RSS feeds | Public RSS |
+| **Jobspresso** | [`jobspresso.co/jobs/feed/`](https://jobspresso.co/jobs/feed/) | Public RSS |
+
+RemoteOK's and Remotive's own terms ask for a link back to the original listing and credit to
+the source in return for API access — both are satisfied automatically, because every exported
+row's `job_url` points at that platform's own listing page and `source_platform` names it (see
+§9). We Work Remotely's `robots.txt` allows crawling everywhere except account/admin pages, and
+its RSS feeds are the same syndication format the site links from its own categories page.
+Jobspresso's `robots.txt` disallows only query-string URLs (`Disallow: /*?`), so its feed is
+fetched with no query string and filtered locally instead of ever being asked to search.
+
+**Not integrated, on purpose** — both were checked and neither has a legitimate free/public
+path in:
+
+- **Wellfound (formerly AngelList Talent)** — job search only works through an authenticated
+  session calling the site's internal GraphQL API; there is no public REST/JSON API, and
+  `robots.txt` explicitly disallows the query-string URLs (`?jobId=`, `?jobSlug=`, …) that
+  identify a listing. Scraping the rendered page would mean automating a login and ignoring
+  `robots.txt` — both against this project's rule of never bypassing access controls.
+- **FlexJobs** — a paid subscription board. Listings are behind a paywall and FlexJobs' own
+  terms prohibit automated collection or redistribution of its (paid) content. It offers no
+  public API.
+
+### How the dedicated boards fit the existing search
+
+None of these four boards support the country-partitioned search JobSpy gets from
+`country_indeed` — each returns one global feed. Two things follow, both handled in
+`job_sources.py`:
+
+- **Fetched once, reused across countries.** A Europe search tries five countries in turn;
+  re-fetching RemoteOK's whole feed five times for one run would be wasteful and rude to a free
+  API. Each board's raw feed is cached for the life of one pipeline run (`job_sources.
+  reset_cache()`, called once in `collect_jobs()`) and re-filtered locally per country.
+- **Required-location filtering.** A job with no stated restriction ("Worldwide", or nothing at
+  all) is offered to every country. A job that says "USA Only" is offered only to a USA search.
+  `job_sources.location_permits()` implements this against the short, structured location field
+  each board actually provides (Remotive's `candidate_required_location`, We Work Remotely's
+  `<region>`, RemoteOK's `location`) — never against the free-text description, where a passing
+  mention of a country is not the same claim as a stated restriction. This is what satisfies
+  the "exclude jobs restricted to a location that is not selected" requirement for these four
+  platforms; Indeed/LinkedIn already get the equivalent from JobSpy's own `country_indeed`
+  parameter.
+
+Beyond that, nothing else changes: the same remote-safety filter, deduplication, ICP
+classification, company scoring and Excel export in §3 run over rows from these platforms
+exactly as they do over Indeed/LinkedIn rows, because every connector returns the identical
+column shape JobSpy does (see `job_sources._ROW_COLUMNS`).
+
+### Reliability
+
+Every platform call is wrapped in `try/except` in both `job_sources.py` (timeout + up to
+`max_retries` retries with backoff) and again in `main.fetch_platform` — a platform that times
+out, rate-limits, or returns malformed data logs a warning and is skipped; it never stops the
+other platforms or the run. Configure timeouts/retries per platform under `job_sources:` in
+`config.yaml`.
+
+### Adding a platform
+
+1. Write `search_<name>(keyword, country_indeed, hours_old, results_wanted, settings) ->
+   pd.DataFrame` in `job_sources.py`, building rows with `_make_row(...)` so the column shape
+   matches every other source.
+2. Add it to `PLATFORM_REGISTRY` at the bottom of that file.
+3. Add its name to `platforms` in `config.yaml` (and, optionally, a settings block under
+   `job_sources:`).
+
+Nothing in `main.py` or `pipeline.py` needs to change — `fetch_platform` already dispatches any
+platform not in `JOBSPY_PLATFORMS` through `job_sources.PLATFORM_REGISTRY`.
 
 ### Why not ZipRecruiter / Glassdoor?
 
@@ -267,21 +442,28 @@ remaining regions are searched automatically in the order USA → UK → Austral
 only valid remote jobs are added until the target is met. Your selected region's jobs always
 stay at the top of the spreadsheet.
 
-Example output from a real run (Australia selected, target 50):
+Example output, illustrative of the shape (platform counts vary run to run - live counts for an
+"AI Engineer" search are in §11 'Verified results — new platform lineup'):
 
 ```
 [SELECTED] Region: Australia  (need 50 more)
     -- Australia --
-      indeed    fetched   2 | stale  0 | carried forward   2
-      linkedin  fetched  50 | stale  0 | carried forward  50
-      google    fetched   0 | stale  0 | carried forward   0
+      indeed         fetched   2 | stale  0 | carried forward   2
+      linkedin       fetched  50 | stale  0 | carried forward  50
+      remoteok       fetched   3 | stale  0 | carried forward   3
+      remotive       fetched   2 | stale  0 | carried forward   2
+      weworkremotely fetched   5 | stale  1 | carried forward   4
+      jobspresso     fetched   1 | stale  0 | carried forward   1
     Australia: running total 39/50
 
 [FALLBACK] Region: USA  (need 11 more)
     -- USA --
-      indeed    fetched  49 | stale  0 | carried forward  49
-      linkedin  fetched  50 | stale  0 | carried forward  50
-      google    fetched   0 | stale  0 | carried forward   0
+      indeed         fetched  49 | stale  0 | carried forward  49
+      linkedin       fetched  50 | stale  0 | carried forward  50
+      remoteok       fetched   4 | stale  0 | carried forward   4
+      remotive       fetched   3 | stale  0 | carried forward   3
+      weworkremotely fetched   6 | stale  0 | carried forward   6
+      jobspresso     fetched   1 | stale  0 | carried forward   1
     USA: running total 103/50
     Target of 50 reached - no further regions will be searched.
 
@@ -299,13 +481,13 @@ Region-by-region (searched in this order, selected region first):
       raw rows fetched    : 52
       valid remote rows   : 42
       running total after : 39/50
-        Australia      raw  52   (indeed:2 | linkedin:50 | google:0)
+        Australia      raw  52   (indeed:2 | linkedin:50 | remoteok:3 | remotive:2 | weworkremotely:4 | jobspresso:1)
 
   [FALLBACK] USA
       raw rows fetched    : 99
       valid remote rows   : 87
       running total after : 103/50  (capped to 50 at export)
-        USA            raw  99   (indeed:49 | linkedin:50 | google:0)
+        USA            raw  99   (indeed:49 | linkedin:50 | remoteok:4 | remotive:3 | weworkremotely:6 | jobspresso:1)
 
   Not searched (target already met): UK, Europe
 
@@ -362,28 +544,29 @@ One row per company, not per job. This is the lead list.
 
 ### The job-level column schema
 
-Every job row behind the leads, kept for audit and debugging — **exactly these 17 columns in
-exactly this order**, unchanged from the brief:
+Every job row behind the leads, kept for audit and debugging — **exactly these 18 columns in
+exactly this order**:
 
 | # | Column | Source | Notes |
 |---|---|---|---|
-| 1 | `search_keyword` | the job title you typed | Needed for QA/debugging |
-| 2 | `source_platform` | JobSpy `site` | `indeed`, `linkedin` or `google` |
-| 3 | `country` | resolved from your location | The country the row was fetched under |
-| 4 | `job_title` | JobSpy `title` | — |
-| 5 | `company_name` | JobSpy `company` | — |
-| 6 | `company_url` | JobSpy `company_url` | Blank if not returned — not fetched separately in Stage 1 |
-| 7 | `company_industry` | JobSpy `company_industry` | Blank if not returned |
-| 8 | `location_raw` | JobSpy `location` | City/state/country exactly as returned |
-| 9 | `is_remote` | the remote filter's decision | `True` for every row |
-| 10 | `job_type` | JobSpy `job_type` | fulltime / parttime / contract / internship, if available |
-| 11 | `date_posted` | JobSpy `date_posted` | — |
-| 12 | `salary_min` | JobSpy `min_amount` | Blank if unavailable — **never estimated** |
-| 13 | `salary_max` | JobSpy `max_amount` | Blank if unavailable — **never estimated** |
-| 14 | `salary_currency` | JobSpy `currency` | Blank if unavailable |
-| 15 | `job_url` | JobSpy `job_url` | The apply link |
-| 16 | `job_description` | JobSpy `description` | Full text, truncated — see below |
-| 17 | `date_fetched` | set by the script | Today's date at run time |
+| 1 | `original_job_title` | the job title you typed | Identical on every row of a run |
+| 2 | `matched_keyword` | the keyword that returned this row | Equals column 1 unless a similar keyword found it — see §7a |
+| 3 | `source_platform` | `site` (JobSpy, or set by job_sources.py) | `indeed`, `linkedin`, `remoteok`, `remotive`, `weworkremotely` or `jobspresso` — see §7b |
+| 4 | `country` | resolved from your location | The country the row was fetched under |
+| 5 | `job_title` | `title` | — |
+| 6 | `company_name` | `company` | — |
+| 7 | `company_url` | `company_url` | Blank if not returned — none of the §7b boards expose a verified company-owned domain, so it stays blank there too, same as any other platform that doesn't provide one |
+| 8 | `company_industry` | `company_industry` | Blank if not returned |
+| 9 | `location_raw` | `location` | City/state/country as returned; for §7b platforms, their stated required-location ("Worldwide", "USA Only", …) |
+| 10 | `is_remote` | the remote filter's decision | `True` for every row |
+| 11 | `job_type` | `job_type` | fulltime / parttime / contract / internship, if available |
+| 12 | `date_posted` | `date_posted` | — |
+| 13 | `salary_min` | `min_amount` | Blank if unavailable — **never estimated** |
+| 14 | `salary_max` | `max_amount` | Blank if unavailable — **never estimated** |
+| 15 | `salary_currency` | `currency` | Blank if unavailable |
+| 16 | `job_url` | `job_url` | **The original listing on that platform** — RemoteOK/Remotive/WWR/Jobspresso rows link to their own listing page, never a copy or a search result |
+| 17 | `job_description` | `description` | Full text, truncated — see below |
+| 18 | `date_fetched` | set by the script | Today's date at run time |
 
 > ⚠️ **This schema is fixed.** Do not add, remove, rename or reorder columns without approval.
 
@@ -403,7 +586,7 @@ exactly this order**, unchanged from the brief:
 6. **Combine** — tag each row with `search_keyword` and `country`, concatenate into one DataFrame.
 7. **Remote safety filter** — apply the three-way rule from §3, keeping the dropped rows aside for review.
 8. **Deduplicate** — prefer `job_url`; fall back to normalised `title + company + location` for rows without a URL.
-9. **Cap and reshape** — trim to `target_total_jobs`, map to the fixed 17-column schema, add `date_fetched`, truncate long descriptions.
+9. **Cap and reshape** — trim to `target_total_jobs`, map to the fixed 18-column schema, add `date_fetched`, truncate long descriptions.
 10. **Export** — write the `.xlsx`, plus the dropped-rows CSV when anything was dropped.
 11. **Print the run summary** — counts at each stage, per-platform breakdown, and a note when the final count is below target.
 
@@ -418,7 +601,7 @@ exactly this order**, unchanged from the brief:
 | 3 | **Per-platform sanity check** | No platform is unexpectedly empty; a `0` is flagged in the summary |
 | 4 | **Remote-only spot check** | Open 10 random `job_url` values; each posting is genuinely remote |
 | 5 | **Duplicate check** | No two rows share a `job_url` |
-| 6 | **Column check** | Exactly the 17 columns of §9, in that order |
+| 6 | **Column check** | Exactly the 18 columns of §9, in that order |
 | 7 | **Long-description check** | Export succeeds; no cell exceeds Excel's limit |
 | 8 | **Region menu** | Only 1-4 (or a region name) is accepted; anything else re-prompts |
 | 9 | **Failure resilience** | A platform that errors is logged; the run still produces a file |
@@ -434,7 +617,7 @@ exactly this order**, unchanged from the brief:
 | 19 | **Selected region first** | Every selected-region row appears above every fallback row in the exported file |
 | 20 | **Europe early exit** | Europe stops after the first country that meets the target instead of searching all five |
 | 21 | **Cross-region dedup** | A posting found in two regions appears once, credited to the selected region |
-| 22 | **Nothing anywhere** | If no region returns jobs, all four are tried, the run does not crash, and the file still has the 17 columns |
+| 22 | **Nothing anywhere** | If no region returns jobs, all four are tried, the run does not crash, and the file still has the 18 columns |
 
 ### Verified results (2026-09-08)
 
@@ -468,6 +651,56 @@ fallback paths, fallback ordering, selected-region-first ordering, Europe's earl
 cross-region dedup, the fixed schema, per-platform parameter construction, both strictness
 modes, all three dedup passes, pagination, and platform-error resilience.
 
+### Verified results — new platform lineup (2026-09-09)
+
+Live `AI Engineer` / USA search, default keyword expansion capped to 3 keywords for the run
+(`AI Engineer`, `Artificial Intelligence Engineer`, `Machine Learning Engineer`), 20 results
+requested per platform, target 120:
+
+| Platform | Raw fetched (USA) | Notes |
+|---|---|---|
+| indeed | 57 | via JobSpy |
+| linkedin | 60 | via JobSpy |
+| remoteok | 1 match, 0 kept | the one match (`AI Engineer Data APIs` @ Benzinga) was 10 days old — outside the default 168h window |
+| remotive | 1 match, 0 kept | the one match (`Senior Independent AI Engineer / Architect`, required location `Americas, Europe, Israel`) was 24 days old |
+| weworkremotely | 7 matches, 0 kept | all 7 matches (`AI/ML Engineer for an AI-Driven E-Commerce Platform` @ Toptal, `Senior Software AI Engineer` @ Collaboration.Ai, etc.) were 14–24 days old |
+| jobspresso | 0 | its ~20-item recent feed had no title containing both "AI" and "Engineer" at the time of the run |
+
+Re-run with `hours_old: 720` (30 days) instead of the 168-hour default, everything else
+unchanged, to confirm the boutique platforms' full path through the pipeline — fetch, remote
+filter, dedup, ICP, cap, export — once their postings are inside the window:
+
+```
+indeed              72 rows
+linkedin            40 rows
+remoteok             1 rows
+remotive             1 rows
+weworkremotely       6 rows
+jobspresso           0 rows
+                   -------
+Total exported     120 rows   (target 120, USA 98 + UK fallback 22)
+Duplicate job_urls in export: 0
+Rows flagged remote: 120/120
+```
+
+Confirms the same three matches that were correctly excluded as stale above (RemoteOK's,
+Remotive's, and 6 of We Work Remotely's 7) are correctly *included* once they're inside the
+recency window, and reach the export with their `source_platform`/`job_url` intact -
+`source_platform` values `remoteok`/`remotive`/`weworkremotely` and real listing URLs
+(`remoteok.com/remote-jobs/...`, `remotive.com/remote-jobs/...`,
+`weworkremotely.com/remote-jobs/...`) all present in the output workbook. Jobspresso's 0 is
+unrelated to recency - see the row above.
+
+This is the accurate, current state of these boards for one specific title, not a defect: they
+are small, live, general-audience remote-job feeds (RemoteOK's whole feed is ~100 postings
+across every field, not just tech; We Work Remotely's tech categories return ~170 recent
+postings across all of software engineering). A title as specific as "AI Engineer" naturally
+has few matches in a 7-day window on any one of them — which is exactly why keyword expansion
+(§7a) and searching four extra platforms both matter more here than they would for Indeed or
+LinkedIn's much larger indexes. Widening `hours_old`, adding more of §7a's expanded keywords,
+or raising `job_sources.<platform>.results_wanted` in config.yaml all increase the number of
+matches these boards contribute.
+
 ---
 
 ## 12. Acceptance criteria (definition of done)
@@ -487,7 +720,8 @@ modes, all three dedup passes, pagination, and platform-error resilience.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | A platform returns 0 results | Country not resolved, or that board has nothing matching | Include the country in your location answer (e.g. "Berlin, Germany") |
-| Google Jobs returns 0 | Google Jobs scraping is broken in JobSpy 1.1.82 (the latest release) - it returned 0 for every query tested, including a plain US control search | Not fixable from this project. Indeed and LinkedIn carry the run; the summary reports the 0 rather than hiding it |
+| A §7b platform (RemoteOK/Remotive/WWR/Jobspresso) returns 0 | Its feed genuinely has nothing matching that keyword right now (these are small, live, frequently-changing feeds - see §11 'Verified results — new platform lineup'), or the call failed and was logged as a `[WARN]` | Check the console for a `[WARN]` line naming that platform; if there isn't one, the feed is just thin for that search right now |
+| Google Jobs used to return 0 | Removed - Google Jobs scraping was broken in JobSpy 1.1.82, returning 0 for every query tested including a plain US control search. Replaced by the §7b platforms, each with a real, working access method | N/A - no longer part of `platforms` |
 | Far fewer jobs than expected | Sending `hours_old` and `is_remote` to Indeed together silently cancels Indeed's remote filter | Fixed - Indeed now gets `is_remote`, and the date cut-off is applied locally on `date_posted` |
 | `ModuleNotFoundError: jobspy` | Virtual environment not activated, or dependencies not installed | Activate `.venv`, re-run `pip install -r requirements.txt` |
 | `PermissionError` on export | The output file is still open in Excel | The script saves under a `_2` suffix automatically; close Excel to get the plain filename |
@@ -518,9 +752,13 @@ modes, all three dedup passes, pagination, and platform-error resilience.
 5. **JobSpy's `is_remote` flag means different things per platform.** Indeed sets it from the
    real server-side filter. LinkedIn ignores it on output and recomputes it with a text
    heuristic, so genuinely-remote rows (already restricted by LinkedIn's own `f_WT=2` filter)
-   often come back flagged `False` — measured at 17–18 of 20. Google derives it from
-   description text alone. Dropping every `False` row therefore destroys valid results, which
-   is exactly what produced a 3-row spreadsheet. The tiered filter in §3 replaces that rule.
+   often come back flagged `False` — measured at 17–18 of 20. Google (now removed - see §7b)
+   derived it from description text alone too. Dropping every `False` row therefore destroys
+   valid results, which is exactly what produced a 3-row spreadsheet. The tiered filter in §3
+   replaces that rule - and it's why the §7b connectors leave `is_remote` unset rather than
+   asserting `True` from "this board is remote-only": a board that is remote-only in general
+   can still list one hybrid posting by mistake, and the tiered text check is what actually
+   catches that (see §11 'Verified results — new platform lineup').
 
 6. **`remote_strictness` is a genuine trade-off, not a tuning knob.** Both platforms' remote
    filters were verified to work: requesting remote returns a materially different result set
@@ -541,12 +779,12 @@ modes, all three dedup passes, pagination, and platform-error resilience.
 7b. **Every dropped row is written to `dropped_for_review_*.csv`** with the reason it was
    dropped, so the filter's decisions can be audited rather than trusted.
 
-8. **"Europe" is not a searchable value** on Indeed, LinkedIn or Google Jobs — the Stage 1
-   brief flags this too. It expands to Germany, Netherlands, Ireland, France and Spain,
+8. **"Europe" is not a searchable value** on Indeed or LinkedIn — the Stage 1 brief flags this
+   too. It expands to Germany, Netherlands, Ireland, France and Spain,
    searched in turn with an early exit once the target is met. Edit `REGION_DEFINITIONS` in
    `main.py` to change that list; the countries should be confirmed with the business.
 
-9. **The region is recorded in the existing `country` column,** not a new one. The 17-column
+9. **The region is recorded in the existing `country` column,** not a new one. The 18-column
    schema is fixed by the brief, so region tracking uses an internal `_region` column that is
    dropped before export.
 

@@ -24,32 +24,96 @@ NOT_FOUND = "Not Found"
 # NOT the body of its job adverts, which mention "consulting" and
 # "services" far too often to be safe evidence.
 COMPETITOR_TYPE_PATTERNS = {
+    # Companies whose primary business is supplying people to other
+    # organisations rather than buying software for their own operation.
     "staffing_agency": [
-        "staffing", "staff augmentation", "temp agency", "temporary staffing",
-        "contract staffing", "manpower", "workforce solutions", "talent solutions",
+        "staffing agency", "staffing company", "staffing services",
+        "staff augmentation", "temp agency", "temporary staffing",
+        "contract staffing", "workforce solutions", "talent solutions",
+        "professional staffing", "employment agency", "contingent workforce",
     ],
     "recruitment_agency": [
         "recruitment agency", "recruiting agency", "recruitment firm",
-        "executive search", "headhunt", "talent acquisition firm",
-        "recruitment consultancy", "placement agency",
+        "executive search", "headhunting agency", "headhunt",
+        "talent acquisition firm", "recruitment consultancy",
+        "placement agency", "employment placement", "search firm",
     ],
+    # Traditional IT service providers are lower-probability buyers when
+    # the product duplicates services they sell to their own customers.
     "it_services": [
-        "it services", "information technology services", "system integrator",
-        "systems integrator", "managed services provider", "it consulting",
-        "technology services provider", "it solutions provider",
+        "it services company", "information technology services",
+        "it solutions provider", "it solutions company", "technology services provider",
+        "managed services provider", "managed it services", "it consulting",
+        "technology consulting", "technology services", "systems integrator",
+        "system integrator", "digital transformation services",
     ],
     "ai_ml_consulting": [
-        "ai consulting", "ml consulting", "machine learning consulting",
-        "data science consulting", "ai solutions provider", "ai services company",
-        "artificial intelligence consultancy", "ai consultancy",
+        "ai consulting", "ai consulting firm", "ai consultancy",
+        "artificial intelligence consultancy", "ml consulting",
+        "machine learning consulting", "data science consulting",
+        "data science consultancy", "ai solutions provider",
+        "ai services company", "artificial intelligence services",
+        "machine learning services",
     ],
     "software_outsourcing": [
-        "software outsourcing", "outsourcing", "offshore development",
-        "nearshore development", "software development agency",
+        "software outsourcing", "software outsourcing company",
+        "offshore development", "nearshore development",
+        "software development agency", "software development services",
         "product engineering services", "software house", "dev shop",
         "digital agency", "software consultancy", "engineering services provider",
+        "custom software development company", "custom software services",
+    ],
+    # These businesses frequently sell implementation or managed technical
+    # work as their primary offering, so they are usually lower-probability
+    # buyers of the same kind of product.
+    "bpo_services": [
+        "business process outsourcing", "bpo services", "bpo company",
+        "business process services", "outsourcing services provider",
     ],
 }
+
+# Human-readable prospecting dictionary exposed to the frontend. This is
+# deliberately data, not logic, so business users can review what the
+# filter considers a low-probability buyer.
+COMPETITOR_DICTIONARY = {
+    "staffing_agency": {
+        "label": "Staffing / Staff Augmentation",
+        "buy_probability": "Very Low",
+        "reason": "Their core business is supplying workers or staff augmentation to clients.",
+        "patterns": COMPETITOR_TYPE_PATTERNS["staffing_agency"],
+    },
+    "recruitment_agency": {
+        "label": "Recruitment / Executive Search",
+        "buy_probability": "Very Low",
+        "reason": "They mainly sell recruiting, placement, or executive-search services.",
+        "patterns": COMPETITOR_TYPE_PATTERNS["recruitment_agency"],
+    },
+    "it_services": {
+        "label": "IT Services / Systems Integrator",
+        "buy_probability": "Very Low",
+        "reason": "They sell IT consulting, managed services, systems integration, or technology services.",
+        "patterns": COMPETITOR_TYPE_PATTERNS["it_services"],
+    },
+    "ai_ml_consulting": {
+        "label": "AI / ML Consulting",
+        "buy_probability": "Very Low",
+        "reason": "AI, ML, or data-science consulting is already a core service they provide to clients.",
+        "patterns": COMPETITOR_TYPE_PATTERNS["ai_ml_consulting"],
+    },
+    "software_outsourcing": {
+        "label": "Software Outsourcing / Development Agency",
+        "buy_probability": "Very Low",
+        "reason": "They primarily deliver outsourced or custom software-development services to customers.",
+        "patterns": COMPETITOR_TYPE_PATTERNS["software_outsourcing"],
+    },
+    "bpo_services": {
+        "label": "BPO / Business Process Services",
+        "buy_probability": "Very Low",
+        "reason": "Their primary business is outsourcing business processes or related delivery services.",
+        "patterns": COMPETITOR_TYPE_PATTERNS["bpo_services"],
+    },
+}
+
 
 # Phrases in a JOB ADVERT that reliably mark the poster as an
 # intermediary hiring on someone else's behalf. Unlike the generic words
@@ -63,7 +127,8 @@ INTERMEDIARY_JOB_TEXT_PATTERNS = [
 # Words that mark a name as an agency even without a description.
 AGENCY_NAME_PATTERNS = [
     "staffing", "recruit", "talent", "headhunt", "manpower",
-    "consultancy", "consulting", "outsourcing", "technologies services",
+    "consultancy", "consulting", "outsourcing", "bpo",
+    "technologies services", "solutions provider",
 ]
 
 
@@ -122,6 +187,19 @@ def size_band(estimate, lead_config: dict) -> str:
         return "Medium" if estimate >= medium_threshold else "Preferred ICP"
     return "Large"
 
+
+
+def exclusion_dictionary() -> dict:
+    """Return a JSON-safe copy of the business exclusion dictionary."""
+    return {
+        key: {
+            "label": value["label"],
+            "buy_probability": value["buy_probability"],
+            "reason": value["reason"],
+            "patterns": list(value["patterns"]),
+        }
+        for key, value in COMPETITOR_DICTIONARY.items()
+    }
 
 def classify_company_type(company: dict) -> tuple:
     """Identify the company's business type from its own description.

@@ -33,6 +33,11 @@ const statusDetail = document.getElementById("status-detail");
 const spinner = document.getElementById("spinner");
 const results = document.getElementById("results");
 const downloadButton = document.getElementById("download-button");
+const dictionaryButton = document.getElementById("dictionary-button");
+const dictionaryCard = document.getElementById("dictionary-card");
+const dictionaryContent = document.getElementById("dictionary-content");
+const dictionaryNote = document.getElementById("dictionary-note");
+const dictionaryClose = document.getElementById("dictionary-close");
 const apiTarget = document.getElementById("api-target");
 
 let currentRunId = null;
@@ -123,9 +128,25 @@ function describeCounts(run) {
   if (counts.Medium) parts.push(`${counts.Medium} medium`);
   if (counts.Low) parts.push(`${counts.Low} low`);
   const priority = parts.length ? ` (${parts.join(", ")} priority)` : "";
+  const leadTarget = run.target_leads ?? 50;
+  const leadCount = run.leads_selected ?? run.current_leads ?? 0;
+  const progress = ` ${leadCount}/${leadTarget} leads.`;
+
+  // The backend also searches closely-related job titles, so say which
+  // ones - otherwise a row whose title is not the one that was typed
+  // looks like a mistake.
+  const similar = run.similar_keywords || [];
+  const alsoSearched = similar.length
+    ? ` Also searched ${similar.length} similar title${
+        similar.length === 1 ? "" : "s"
+      }: ${similar.join(", ")}.`
+    : "";
+
+  const locations = run.regions_searched || [];
+  const locationText = locations.length ? ` Locations searched: ${locations.join(", ")}.` : "";
   return `${run.unique_companies ?? 0} unique companies found, ${
     run.excluded_companies ?? 0
-  } excluded${priority}.`;
+  } excluded${priority}.${progress}${locationText}${alsoSearched}`;
 }
 
 async function pollStatus() {
@@ -166,8 +187,73 @@ async function pollStatus() {
     return;
   }
 
-  setStatus("loading", run.stage || "Working…", "This can take several minutes.");
+  const current = run.current_leads ?? 0;
+  const target = run.target_leads ?? 50;
+  const location = run.current_region ? ` Searching ${run.current_region}.` : "";
+  setStatus(
+    "loading",
+    run.stage || "Working…",
+    `Qualified leads: ${current}/${target}.${location}`
+  );
 }
+
+async function loadExclusionDictionary() {
+  try {
+    const response = await fetch(`${API_BASE}/api/exclusion-dictionary`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    dictionaryNote.textContent = data.note || "";
+
+    const categories = data.categories || {};
+    const cards = Object.entries(categories).map(([key, item]) => {
+      const patterns = (item.patterns || []).join(", ");
+      return `
+        <article class="dictionary-item">
+          <div class="dictionary-item-top">
+            <div>
+              <h3>${escapeHtml(item.label || key)}</h3>
+              <span class="probability">${escapeHtml(item.buy_probability || "Low")}</span>
+            </div>
+            <span class="dictionary-key">${escapeHtml(key)}</span>
+          </div>
+          <p>${escapeHtml(item.reason || "")}</p>
+          <details>
+            <summary>Matching phrases</summary>
+            <div class="pattern-list">${escapeHtml(patterns)}</div>
+          </details>
+        </article>`;
+    }).join("");
+
+    const excluded = data.persistent_excluded_companies || [];
+    const excludedHtml = excluded.length
+      ? `<div class="watchlist-section"><h3>Permanent excluded-company dictionary (${excluded.length})</h3><p class="dictionary-note">These companies are saved in the JSON dictionary and remain available on future runs.</p><div class="watchlist">${excluded.map(item => `
+          <div class="watchlist-row">
+            <strong>${escapeHtml(item.company_name || "Unknown company")}</strong>
+            <span>${escapeHtml(item.category || "Unknown")}</span>
+            <span>${escapeHtml(item.reason || "Excluded by ICP rule")}</span>
+            <small>Seen ${escapeHtml(item.times_seen || 1)} time(s)</small>
+          </div>`).join("")}</div></div>`
+      : `<div class="watchlist-empty">The permanent dictionary is empty. Newly excluded companies will be saved here automatically.</div>`;
+
+    dictionaryContent.innerHTML = `<div class="dictionary-grid">${cards}</div>${excludedHtml}`;
+    dictionaryCard.hidden = false;
+  } catch (error) {
+    dictionaryContent.innerHTML = `<div class="watchlist-empty">Could not load the dictionary. Make sure the backend is running.</div>`;
+    dictionaryCard.hidden = false;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+dictionaryButton.addEventListener("click", loadExclusionDictionary);
+dictionaryClose.addEventListener("click", () => { dictionaryCard.hidden = true; });
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();

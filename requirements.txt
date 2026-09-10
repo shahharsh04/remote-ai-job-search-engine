@@ -2,9 +2,11 @@ python-jobspy
 pandas
 openpyxl
 pyyaml
+# Used directly by job_sources.py (RemoteOK/Remotive APIs) - the CLI
+# needs this even without the HTTP API layer below.
+requests
 
 # HTTP API layer (api.py) - only needed when serving the frontend.
 # The CLI (python main.py) does not require these.
 fastapi
 uvicorn[standard]
-requests

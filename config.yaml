@@ -7,7 +7,26 @@
 # =============================================================================
 
 # Job platforms to search every time.
-platforms: ["indeed", "linkedin", "google"]
+#
+# "indeed" and "linkedin" go through JobSpy (see main.JOBSPY_PLATFORMS).
+# Google Jobs ("google") has been REMOVED - see job_sources.py's module
+# docstring and README sec. 7b for why - replaced by dedicated remote
+# job boards, each reached through its own public API or RSS feed (see
+# job_sources.PLATFORM_REGISTRY and the `job_sources:` block below):
+#   remoteok        - https://remoteok.com/api            (public JSON API)
+#   remotive        - https://remotive.com/api/remote-jobs (public JSON API)
+#   weworkremotely  - per-category RSS feeds               (public RSS)
+#   jobspresso      - https://jobspresso.co/jobs/feed/      (public RSS)
+#
+# NOT included, on purpose - no legitimate free/public access exists:
+#   Wellfound / AngelList Talent - no public API; job search needs an
+#     authenticated session, and robots.txt blocks the job-detail URLs.
+#   FlexJobs - subscription paywall; its terms prohibit automated
+#     collection of listings, and it offers no public API.
+# Add a platform by writing search_<name>() in job_sources.py,
+# registering it in PLATFORM_REGISTRY, then adding its name below -
+# nothing in main.py or pipeline.py needs to change.
+platforms: ["indeed", "linkedin", "zip_recruiter", "glassdoor", "remoteok", "remotive", "weworkremotely", "jobspresso"]
 
 # Only consider postings from the last N hours (168 = 7 days).
 hours_old: 168
@@ -27,6 +46,13 @@ max_pages_per_platform: 3
 # rows rather than being padded.
 target_total_jobs: 50
 
+# Lead target controls when the location search stops. This is different
+# from target_total_jobs, which controls the size of the job audit sheet.
+lead_search:
+  # Search up to this many valid remote job rows per location pass before
+  # running the company/ICP/contact pipeline to see how many leads exist.
+  job_buffer_per_location: 250
+
 # Folder where the output .xlsx file is written.
 output_dir: "./output"
 
@@ -39,6 +65,113 @@ output_dir: "./output"
 #                        (platform flag, or "remote"/"work from home"
 #                        wording). Fewer jobs, higher confidence.
 remote_strictness: "balanced"
+
+
+# =============================================================================
+# Similar-job-title keyword expansion
+# =============================================================================
+# A search for "AI Engineer" also searches the titles recruiters use for
+# the same job - "Machine Learning Engineer", "ML Engineer", "AI/ML
+# Engineer" and so on - across every platform above.
+#
+# The title you type is always keyword #1 and is never rewritten;
+# expansion only adds terms. Every added term is validated first: too
+# broad ("Engineer"), a different kind of role ("Data Analyst" for an
+# engineering search) or malformed terms are rejected and reported.
+#
+# Set enabled: false to search exactly the title you typed, as before.
+keyword_expansion:
+  enabled: true
+
+  # Total keywords searched per run, INCLUDING your own title. Each
+  # extra keyword is another pass over every platform, so this is the
+  # main cost/coverage dial. The keyword loop stops early once the
+  # target row count is met, so this is a ceiling, not a fixed cost.
+  max_keywords: 6
+
+  # Generate "Engineer" <-> "Developer" variants of the title.
+  role_noun_synonyms: true
+
+  # Generate the opposite spelling of an abbreviation, e.g.
+  # "AI Engineer" -> "Artificial Intelligence Engineer".
+  abbreviation_variants: true
+
+  # Carry "Senior"/"Lead" from your title onto the generated keywords.
+  # Off by default - job boards match seniority loosely, and adding it
+  # narrows results sharply for little gain.
+  preserve_seniority: false
+
+  # Force in keywords the built-in tables do not cover. Keyed by the
+  # title you type (matched loosely, so casing and "Sr." do not matter).
+  # These are trusted: only their shape is checked, not their topic.
+  extra_synonyms: {}
+  #  "AI Engineer":
+  #    - "Foundation Model Engineer"
+
+  # Extra terms to reject, added to the built-in list of broad terms.
+  blocked_terms: []
+
+  # Optional: ask a model for additional titles. Off by default; the
+  # built-in tables need no API key and no network call.
+  #
+  # The model is asked for job TITLES only - it is never a source of job
+  # listings, and everything it returns goes through the same validation
+  # as every other keyword before any platform is searched.
+  # Needs `pip install anthropic` and ANTHROPIC_API_KEY in the
+  # environment. If it fails or is unreachable, the run continues on the
+  # built-in tables.
+  ai:
+    enabled: false
+    provider: "anthropic"
+    model: "claude-sonnet-5"
+    max_suggestions: 8
+    timeout_seconds: 20
+    api_key_env: "ANTHROPIC_API_KEY"
+
+
+# =============================================================================
+# Dedicated job-board connectors (job_sources.py)
+# =============================================================================
+# Network settings for the platforms in `platforms` above that are NOT
+# fetched through JobSpy - RemoteOK, Remotive, We Work Remotely,
+# Jobspresso. Every platform inherits `defaults` below, then can be
+# overridden individually by name. A platform that fails (timeout, HTTP
+# error, malformed response) is skipped after `max_retries` - the run
+# continues on every other platform, it never stops the whole search.
+job_sources:
+  defaults:
+    timeout_seconds: 12
+    max_retries: 2
+    retry_backoff_seconds: 1.5
+    # Identifies this tool to the API/feed it is calling. Polite and
+    # traceable; not a secret.
+    user_agent: "RemoteJobSearchEngine/1.0 (+job search tool; contact via repository)"
+
+  remoteok:
+    # RemoteOK's feed has no search parameter - it returns its ~100 most
+    # recent postings, filtered here by keyword and location. This caps
+    # how many of THOSE matches are kept, not how many are fetched.
+    results_wanted: 40
+
+  remotive:
+    # Remotive's API has a real `search` parameter, so the keyword is
+    # sent server-side rather than filtered after the fact.
+    results_wanted: 40
+
+  weworkremotely:
+    results_wanted: 40
+    # RSS has no keyword search, so these category feeds are fetched in
+    # full and filtered by keyword locally. Add/remove slugs from
+    # https://weworkremotely.com/categories as your searches need.
+    categories:
+      - "remote-programming-jobs"
+      - "remote-full-stack-programming-jobs"
+      - "remote-back-end-programming-jobs"
+      - "remote-front-end-programming-jobs"
+      - "remote-devops-sysadmin-jobs"
+
+  jobspresso:
+    results_wanted: 40
 
 
 # =============================================================================
@@ -57,10 +190,11 @@ lead_pipeline:
   low_priority_employee_threshold: 5000
 
   # ---- Final lead list ------------------------------------------------
-  # If fewer than min_final_leads qualify, the run reports the shortfall
-  # rather than padding the list.
-  max_final_leads: 15
-  min_final_leads: 10
+  # The business target is 50 qualified leads. The list is always sorted
+  # High -> Medium -> Low by priority score, with no fabricated rows.
+  target_leads: 50
+  max_final_leads: 50
+  min_final_leads: 50
 
   # ---- Exclusions -----------------------------------------------------
   # Company types whose primary business competes with an AI
@@ -73,9 +207,12 @@ lead_pipeline:
     - it_services
     - ai_ml_consulting
     - software_outsourcing
+    - bpo_services
 
   # Write excluded companies to their own CSV for audit.
   save_excluded_companies: true
+  # Persistent cumulative dictionary across application runs.
+  excluded_company_dictionary_path: data/excluded_companies.json
 
   # ---- Contact enrichment ---------------------------------------------
   contact_enrichment:
@@ -85,7 +222,7 @@ lead_pipeline:
     respect_robots_txt: true
     request_timeout_seconds: 8
     # Enrichment makes network calls, so it is budgeted per run.
-    max_companies_to_enrich: 20
+    max_companies_to_enrich: 100
     # LinkedIn *search* links for recruiter titles. These are research
     # links, never claimed profiles - profiles cannot be read without
     # scraping behind a login, which this project does not do.

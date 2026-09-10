@@ -2,9 +2,10 @@
 Remote AI Job Search Engine (interactive CLI)
 ==============================================
 Prompts the user for a job title, a location, and a remote-only
-confirmation, then searches Indeed, LinkedIn, and Google Jobs for
-matching remote postings via JobSpy, filters/deduplicates the results,
-and writes a single Excel file to output/.
+confirmation, then searches Indeed and LinkedIn via JobSpy plus the
+dedicated remote job boards in job_sources.py (RemoteOK, Remotive, We
+Work Remotely, Jobspresso), filters/deduplicates the results, and
+writes a single Excel file to output/.
 
 Run:
     python main.py [path/to/config.yaml]
@@ -28,6 +29,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from jobspy import scrape_jobs
 
+import job_sources
+import keywords as keyword_expansion
 import pipeline
 
 # Excel's per-cell character limit. Long job descriptions get truncated
@@ -41,7 +44,12 @@ log = logging.getLogger("job_search")
 # JobSpy DataFrame (JobSpy's column naming has varied slightly across
 # versions, so we check a few candidates for each field).
 OUTPUT_COLUMNS = {
-    "search_keyword": ["search_keyword"],
+    # What the user typed, and the expanded keyword that actually
+    # returned this row. Both are exported so a row that came back under
+    # a similar title ("ML Engineer" for a search of "AI Engineer") can
+    # be traced to the reason it was included.
+    "original_job_title": ["original_job_title"],
+    "matched_keyword": ["search_keyword"],
     "source_platform": ["site", "SITE"],
     "country": ["country"],
     "job_title": ["title", "TITLE"],
@@ -113,13 +121,31 @@ def load_config(path: str) -> dict:
     else:
         log.warning(f"[WARN] Config file not found at '{path}' - using built-in defaults.")
 
-    config.setdefault("platforms", ["indeed", "linkedin", "google"])
+    # Google Jobs (JobSpy's "google") is deliberately gone - see README
+    # sec. 7a and job_sources.py's module docstring for why - replaced by
+    # dedicated remote-only boards reached through their own public
+    # APIs/RSS feeds rather than Google's aggregation.
+    config.setdefault(
+        "platforms",
+        ["indeed", "linkedin", "remoteok", "remotive", "weworkremotely", "jobspresso"],
+    )
     config.setdefault("hours_old", 168)
     config.setdefault("results_wanted_per_platform", 50)
     config.setdefault("max_pages_per_platform", 3)
     config.setdefault("target_total_jobs", 50)
+    config.setdefault("lead_search", {"job_buffer_per_location": 250})
     config.setdefault("output_dir", "./output")
     config.setdefault("remote_strictness", "balanced")
+
+    # Similar-title keyword expansion. Normalised here so every caller -
+    # CLI, API, or a script importing this module - sees a complete
+    # settings block whether or not config.yaml defines one.
+    config["keyword_expansion"] = keyword_expansion.load_keyword_config(config)
+
+    # Per-platform timeouts/retries for the dedicated job-board
+    # connectors (job_sources.py). Same reasoning as keyword_expansion
+    # above - always present, never required in config.yaml.
+    config["job_sources"] = job_sources.load_source_config(config)
 
     if config["remote_strictness"] not in ("balanced", "strict"):
         log.warning(
@@ -213,22 +239,57 @@ def build_search_kwargs(platform: str, job_title: str, location: str,
         # every LinkedIn row has an empty description, which starves the
         # remote text check of anything to read.
         kwargs["linkedin_fetch_description"] = True
-    elif platform == "google":
-        kwargs["google_search_term"] = f"{job_title} jobs remote in {location}"
 
     return kwargs, True
 
 
+# Platforms fetched through JobSpy (build_search_kwargs + scrape_jobs).
+# Everything else in config["platforms"] is looked up in
+# job_sources.PLATFORM_REGISTRY instead - see fetch_platform below.
+JOBSPY_PLATFORMS = {"indeed", "linkedin", "zip_recruiter", "glassdoor", "bayt", "naukri", "bdjobs"}
+
+
 def fetch_platform(platform: str, job_title: str, location: str, country_indeed: str,
                    hours_old: int, results_wanted: int,
-                   max_pages: int) -> tuple[pd.DataFrame, bool]:
-    """Fetch one platform, paginating with `offset` until we have the
-    requested number of rows or the platform stops returning new ones.
+                   max_pages: int, source_config: dict = None) -> tuple[pd.DataFrame, bool]:
+    """Fetch one platform. Never raises - a failing platform logs a
+    warning and yields whatever it collected so far (or nothing), so one
+    bad platform cannot kill the run.
 
-    Returns (df, hours_old_applied_server_side). Never raises - a failing
-    platform logs a warning and yields whatever it collected so far, so
-    one bad platform cannot kill the run.
+    Returns (df, hours_old_applied_server_side).
+
+    Dispatches to one of two implementations depending on the platform:
+      - JOBSPY_PLATFORMS (Indeed, LinkedIn, ...) go through JobSpy, with
+        pagination via `offset` - the original Stage 1 behaviour.
+      - Everything else is looked up in job_sources.PLATFORM_REGISTRY,
+        the dedicated remote-board connectors (RemoteOK, Remotive, We
+        Work Remotely, Jobspresso). These fetch and paginate themselves
+        and are not designed for JobSpy's offset-based pagination
+        (their APIs/feeds are not partitioned that way), so max_pages
+        does not apply to them - `results_wanted` is passed straight
+        through as the cap.
+      - A platform in neither set (e.g. a typo, or one of the
+        deliberately-unsupported names in job_sources.UNAVAILABLE_
+        PLATFORMS) logs a clear warning and returns no rows rather than
+        raising, so a bad config.yaml entry cannot stop the run either.
     """
+    if platform not in JOBSPY_PLATFORMS:
+        try:
+            df = job_sources.search(
+                platform, job_title, country_indeed, hours_old, results_wanted,
+                source_config or job_sources.load_source_config({}),
+            )
+        except job_sources.JobSourceError as exc:
+            log.warning(f"    [WARN] {platform}: {exc}")
+            return pd.DataFrame(), False
+        except Exception as exc:
+            log.warning(f"    [WARN] {platform}: unexpected failure: {exc}")
+            return pd.DataFrame(), False
+        # These boards return absolute dates already, so the shared
+        # apply_recency_filter (not a server-side parameter) is what
+        # enforces hours_old for them too - same as Indeed.
+        return df, False
+
     kwargs, hours_applied = build_search_kwargs(
         platform, job_title, location, country_indeed, hours_old
     )
@@ -298,9 +359,15 @@ def apply_recency_filter(df: pd.DataFrame, hours_old: int) -> tuple[pd.DataFrame
     return df[keep], int((~keep).sum())
 
 
-def search_country(job_title: str, entry: dict, config: dict) -> tuple[pd.DataFrame, dict]:
-    """Search every configured platform for one country and return the
-    combined raw rows plus a per-platform breakdown."""
+def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
+                              config: dict) -> tuple[pd.DataFrame, dict]:
+    """Search every configured platform for one keyword in one country.
+
+    This is the original per-country search, unchanged except that the
+    term it searches is now a keyword rather than always the user's own
+    title - so every platform receives the expanded keywords too, and
+    each row records which keyword found it.
+    """
     location = entry["location"]
     country_indeed = entry["country_indeed"]
     hours_old = config["hours_old"]
@@ -310,8 +377,9 @@ def search_country(job_title: str, entry: dict, config: dict) -> tuple[pd.DataFr
 
     for platform in config["platforms"]:
         df, hours_applied = fetch_platform(
-            platform, job_title, location, country_indeed, hours_old,
+            platform, keyword, location, country_indeed, hours_old,
             config["results_wanted_per_platform"], config["max_pages_per_platform"],
+            config.get("job_sources"),
         )
         raw_count = len(df)
 
@@ -332,7 +400,11 @@ def search_country(job_title: str, entry: dict, config: dict) -> tuple[pd.DataFr
         if df.empty:
             continue
 
-        df["search_keyword"] = job_title
+        # search_keyword holds the keyword that actually returned the
+        # row; original_job_title holds what the user asked for. Keeping
+        # both is what lets the export explain each row's inclusion.
+        df["search_keyword"] = keyword
+        df["original_job_title"] = original_title
         df["country"] = country_indeed
         frames.append(df)
 
@@ -340,8 +412,65 @@ def search_country(job_title: str, entry: dict, config: dict) -> tuple[pd.DataFr
     return combined, platform_stats
 
 
-def search_region(region: str, job_title: str, config: dict,
-                  needed: int) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
+def search_country(job_title: str, entry: dict, config: dict,
+                   keyword_list: list = None,
+                   needed: int = None) -> tuple[pd.DataFrame, dict, dict]:
+    """Search one country across every configured keyword and platform.
+
+    `keyword_list[0]` is the user's own title and is always searched
+    first, so the primary keyword's rows are the ones that survive
+    deduplication and land at the top of the export. Passing None
+    searches the title alone, which is the pre-expansion behaviour.
+
+    Like the country loop in search_region, the keyword loop stops early
+    once `needed` valid remote rows exist - an extra keyword is only
+    worth its network cost while the target is still short.
+    """
+    keyword_list = keyword_list or [job_title]
+
+    frames = []
+    platform_stats = {}
+    keyword_stats = {}
+
+    for index, keyword in enumerate(keyword_list):
+        if index:
+            log.info(f"      ~ similar keyword: '{keyword}'")
+
+        raw, stats = search_keyword_in_country(keyword, job_title, entry, config)
+        keyword_stats[keyword] = {
+            "raw": len(raw),
+            "primary": index == 0,
+            "platforms": stats,
+        }
+        for platform, values in stats.items():
+            running = platform_stats.setdefault(
+                platform, {"raw": 0, "stale_dropped": 0, "kept": 0}
+            )
+            for field in running:
+                running[field] += values[field]
+
+        if not raw.empty:
+            frames.append(raw)
+
+        if needed is None or not frames:
+            continue
+
+        so_far = pd.concat(frames, ignore_index=True)
+        kept_so_far, _, _ = apply_remote_safety_filter(so_far, config["remote_strictness"])
+        deduped_so_far, _ = deduplicate(kept_so_far)
+        if len(deduped_so_far) >= needed and index + 1 < len(keyword_list):
+            log.info(
+                f"      Target reached in {entry['country_indeed']} - skipping "
+                f"{len(keyword_list) - index - 1} further keyword(s)."
+            )
+            break
+
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return combined, platform_stats, keyword_stats
+
+
+def search_region(region: str, job_title: str, config: dict, needed: int,
+                  keyword_list: list = None) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
     """Search one region - which may be several countries, as Europe is -
     and return its valid remote rows.
 
@@ -359,11 +488,14 @@ def search_region(region: str, job_title: str, config: dict,
         country = entry["country_indeed"]
         log.info(f"    -- {country} --")
 
-        raw, platform_stats = search_country(job_title, entry, config)
+        raw, platform_stats, keyword_stats = search_country(
+            job_title, entry, config, keyword_list, needed
+        )
         raw_frames.append(raw)
         per_country[country] = {
             "raw": len(raw),
             "platforms": platform_stats,
+            "keywords": keyword_stats,
         }
 
         # Filter what we have so far so the early-exit check counts
@@ -406,6 +538,31 @@ def collect_jobs(user_input: dict, config: dict) -> tuple[pd.DataFrame, dict]:
     selected = user_input["region"]
     target = config["target_total_jobs"]
 
+    # The dedicated remote-board connectors (RemoteOK, Remotive, We Work
+    # Remotely, Jobspresso) are not partitioned by country, so they cache
+    # their feed for the life of one run - see job_sources.py. Clearing
+    # it here means a fresh `python main.py` run always sees fresh
+    # listings, while still fetching each feed only once even though
+    # Europe alone searches five countries.
+    job_sources.reset_cache()
+
+    # Expanded once per run, not per region or per platform: the same
+    # keyword list is used everywhere, so a job is never missed in one
+    # region because a different set of keywords was searched there.
+    expansion = keyword_expansion.KeywordExpander(
+        config.get("keyword_expansion")
+    ).expand(job_title)
+    keyword_list = expansion["keywords"] or [job_title]
+
+    log.info(f"\n[KEYWORDS] Searched title: '{job_title}'")
+    if expansion["expanded"]:
+        log.info(
+            f"           Similar keywords ({len(expansion['expanded'])}): "
+            + ", ".join(f"'{k}'" for k in expansion["expanded"])
+        )
+    else:
+        log.info("           No similar keywords found - searching the title alone.")
+
     fallback_order = [r for r in REGION_ORDER if r != selected]
     search_order = [selected] + fallback_order
 
@@ -427,7 +584,7 @@ def collect_jobs(user_input: dict, config: dict) -> tuple[pd.DataFrame, dict]:
         log.info(f"\n[{label}] Region: {region}  (need {needed} more)")
 
         kept, dropped, filter_stats, stats = search_region(
-            region, job_title, config, needed
+            region, job_title, config, needed, keyword_list
         )
         regions_searched.append(region)
         region_stats[region] = stats
@@ -456,8 +613,19 @@ def collect_jobs(user_input: dict, config: dict) -> tuple[pd.DataFrame, dict]:
         pd.concat(dropped_all, ignore_index=True) if dropped_all else pd.DataFrame()
     )
 
+    # How many rows each keyword contributed, counted after dedup so a
+    # posting found by two keywords is credited to the one that found it
+    # first - the primary keyword wherever both did. This is the
+    # collected total; execute_pipeline adds the post-cap count.
+    keyword_counts = {k: 0 for k in keyword_list}
+    if not collected.empty and "search_keyword" in collected.columns:
+        for value in collected["search_keyword"]:
+            keyword_counts[value] = keyword_counts.get(value, 0) + 1
+
     summary = {
         "selected_region": selected,
+        "keyword_expansion": expansion,
+        "keyword_counts_collected": keyword_counts,
         "regions_searched": regions_searched,
         "regions_skipped": regions_skipped + [
             r for r in search_order if r not in regions_searched and r not in regions_skipped
@@ -706,6 +874,8 @@ def _format_worksheet(worksheet) -> None:
         "Contact LinkedIn URL": 34, "Contact Source": 30, "Exclusion Reason": 34,
         "Company Name": 30, "Value": 60, "Metric": 45, "job_url": 34,
         "company_url": 30, "Contact Title": 32, "ICP Status": 26,
+        "Matched Keywords": 45, "Searched Title": 26,
+        "matched_keyword": 30, "original_job_title": 26,
         "Contact Email (2nd)": 28, "Funding Signal": 30, "Team Maturity": 24,
         "AI Hiring Stage": 22, "job_title": 34, "company_name": 26,
     }
@@ -808,7 +978,7 @@ def export_dropped_for_review(dropped_df: pd.DataFrame, output_dir: str) -> str 
     return str(file_path)
 
 
-def print_summary(summary: dict, final_count: int, target_total_jobs: int,
+def print_summary(summary: dict, final_count: int, target_leads: int,
                   strictness: str) -> None:
     selected = summary["selected_region"]
     print("\n" + "=" * 70)
@@ -816,17 +986,38 @@ def print_summary(summary: dict, final_count: int, target_total_jobs: int,
     print("=" * 70)
 
     print(f"\nSelected region : {selected}")
-    print(f"Target count    : {target_total_jobs}")
-    print(f"Final exported  : {final_count}")
+    print(f"Target leads    : {target_leads}")
+    print(f"Final leads     : {final_count}")
+    print(f"Target reached  : {summary.get('target_reached', False)}")
+
+    expansion = summary.get("keyword_expansion") or {}
+    counts = summary.get("keyword_counts") or {}
+    if expansion.get("keywords"):
+        print("\nSearch keywords (primary first) - rows contributed to the exported file:")
+        for index, keyword in enumerate(expansion["keywords"]):
+            label = "primary" if index == 0 else expansion["sources"].get(keyword, "similar")
+            print(f"  {keyword:<42} {counts.get(keyword, 0):>3}  ({label})")
+        if expansion.get("families"):
+            print(f"  Matched title family: {', '.join(expansion['families'])}")
+        rejected = expansion.get("rejected") or []
+        off_topic = [r for r in rejected if not r["reason"].startswith("over the max")]
+        if off_topic:
+            print(f"  Rejected as unrelated or malformed  : {len(off_topic)}")
+            for entry in off_topic[:5]:
+                print(f"    - '{entry['keyword']}' ({entry['source']}): {entry['reason']}")
+        capped = len(rejected) - len(off_topic)
+        if capped:
+            print(f"  Valid but over the keyword cap      : {capped}")
 
     print("\nRegion-by-region (searched in this order, selected region first):")
     for region, stats in summary["region_stats"].items():
         print(f"\n  [{stats['role']}] {region}")
         print(f"      raw rows fetched    : {stats['raw']}")
         print(f"      valid remote rows   : {stats['after_remote_filter']}")
-        running = stats["running_total"]
-        over = f"  (capped to {target_total_jobs} at export)" if running > target_total_jobs else ""
-        print(f"      running total after : {running}/{target_total_jobs}{over}")
+        running_jobs = stats.get("running_jobs", stats.get("raw", 0))
+        running_leads = stats.get("running_leads", 0)
+        print(f"      running jobs after  : {running_jobs}")
+        print(f"      running leads after : {running_leads}/{target_leads}")
         for country, cstats in stats["countries"].items():
             platforms = " | ".join(
                 f"{p}:{ps['kept']}" for p, ps in cstats["platforms"].items()
@@ -869,11 +1060,11 @@ def print_summary(summary: dict, final_count: int, target_total_jobs: int,
         marker = "  <-- selected" if region == selected else ""
         print(f"  {region:<12} {count:>3}{marker}")
 
-    if final_count < target_total_jobs:
+    if final_count < target_leads:
         print(
-            f"\nNote: final count ({final_count}) is below target ({target_total_jobs}) "
-            "even after falling back through every region. That is how many genuine "
-            "remote postings existed after filtering - the count was not padded."
+            f"\nNote: final lead count ({final_count}) is below target ({target_leads}) "
+            "even after falling back through every configured region. Only genuine "
+            "qualified leads were exported; the list was not padded."
         )
     print("=" * 70)
 
@@ -898,6 +1089,10 @@ LEAD_COLUMNS = {
     "Matching Position Count": "matching_position_count",
     "Matching Job Titles": "matching_job_titles",
     "Matching Job URLs": "matching_job_urls",
+    # Why this company is in the list: what was searched for, and which
+    # of the expanded keywords its postings came back under.
+    "Searched Title": "original_job_title",
+    "Matched Keywords": "search_keywords",
     "Hiring Signal": "hiring_signal",
     "Hiring Signal Strength": "hiring_signal_strength",
     "AI Hiring Stage": "ai_hiring_stage",
@@ -961,15 +1156,20 @@ def shape_lead_sheet(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_pipeline_summary_sheet(ctx, jobs_count: int, leads_count: int) -> pd.DataFrame:
-    """The Pipeline Summary sheet: one metric per row."""
+    """Build the workbook's cumulative lead-search summary."""
     icp_stats = ctx.artifacts.get("icp_stats", {})
     contact_stats = ctx.artifacts.get("contact_stats", {})
     selection = ctx.artifacts.get("selection_stats", {})
     dedup_stats = ctx.artifacts.get("company_dedup_stats", {})
+    dynamic = ctx.artifacts.get("dynamic_lead_search", {})
+    search_summary = ctx.artifacts.get("search_summary", {})
     priority_counts = selection.get("priority_counts", {})
+    target = dynamic.get("target_leads", search_summary.get("lead_target", 50))
 
     rows = [
-        ("Total jobs collected", jobs_count),
+        ("Target qualified leads", target),
+        ("Target reached", "Yes" if leads_count >= target else "No"),
+        ("Total job rows in audit", jobs_count),
         ("Total unique companies", dedup_stats.get("companies", 0)),
         ("Companies excluded (competitors)", icp_stats.get("excluded", 0)),
         ("Total qualified companies", icp_stats.get("qualified", 0)),
@@ -980,14 +1180,20 @@ def build_pipeline_summary_sheet(ctx, jobs_count: int, leads_count: int) -> pd.D
         ("High priority", priority_counts.get("High", 0)),
         ("Medium priority", priority_counts.get("Medium", 0)),
         ("Low priority", priority_counts.get("Low", 0)),
+        ("Locations searched", ", ".join(search_summary.get("regions_searched", []))),
+        ("Locations skipped", ", ".join(search_summary.get("regions_skipped", []))),
     ]
 
-    if selection.get("below_minimum"):
+    if leads_count < target:
         rows.append((
             "NOTE",
-            f"Only {leads_count} qualified companies were available, below the "
-            f"configured minimum of {selection.get('minimum')}. The list was not padded.",
+            f"Only {leads_count} genuine qualified leads were available after "
+            f"all configured locations were searched. The workbook was not padded.",
         ))
+
+    for region, stats in search_summary.get("region_stats", {}).items():
+        rows.append((f"{region} - running qualified leads", stats.get("running_leads", 0)))
+        rows.append((f"{region} - audit jobs fetched", stats.get("raw", 0)))
 
     return pd.DataFrame(rows, columns=["Metric", "Value"])
 
@@ -1026,32 +1232,248 @@ def print_pipeline_report(ctx, jobs_count: int, leads_count: int) -> None:
     print("=" * 70)
 
 
-def execute_pipeline(user_input: dict, config: dict, lead_config: dict) -> dict:
-    """Run the whole pipeline and write the workbook.
+def _merge_region_search_summary(summary: dict, region: str, kept: pd.DataFrame,
+                                 dropped: pd.DataFrame, filter_stats: dict, stats: dict,
+                                 role: str) -> None:
+    """Merge one location search into the cumulative run summary."""
+    summary.setdefault("region_stats", {})[region] = dict(stats)
+    summary["region_stats"][region]["role"] = role
 
-    Extracted from main() unchanged so the CLI and the HTTP API run the
-    exact same code path - there is no second implementation of the
-    search, filtering, enrichment or export logic.
+    for key, value in (filter_stats or {}).items():
+        summary.setdefault("filter_totals", {})[key] = (
+            summary["filter_totals"].get(key, 0) + value
+        )
 
-    Returns the context plus the numbers and paths a caller needs to
-    report the result.
+    if dropped is not None and not dropped.empty:
+        summary.setdefault("dropped_frames", []).append(dropped)
+
+
+def _dynamic_lead_target(config: dict, lead_config: dict) -> int:
+    """Return the actual business target for one run."""
+    target = lead_config.get("target_leads", 50)
+    try:
+        target = int(target)
+    except (TypeError, ValueError):
+        target = int(lead_config.get("target_leads", 50))
+    if target <= 0:
+        target = int(lead_config.get("target_leads", 50))
+    return target
+
+
+def _job_buffer_for_location(config: dict, target_leads: int) -> int:
+    """How many valid remote job rows to collect before evaluating leads.
+
+    This is deliberately a buffer rather than the stop condition. One job
+    is not one lead: company deduplication, ICP filtering and scoring can
+    reduce the count substantially. The buffer only limits the amount of
+    work done in one location pass; the final stop condition is always the
+    number of qualified leads returned by the lead pipeline.
+    """
+    block = config.get("lead_search") or {}
+    try:
+        configured = int(block.get("job_buffer_per_location", 250))
+    except (TypeError, ValueError):
+        configured = 250
+    return max(configured, target_leads * 4)
+
+
+def _evaluate_accumulated_jobs(raw_jobs: pd.DataFrame, user_input: dict,
+                               config: dict, lead_config: dict) -> pipeline.PipelineContext:
+    """Run lead stages against all jobs accumulated so far.
+
+    The Job Collection stage is intentionally skipped here because the
+    location loop in execute_pipeline controls collection and decides when
+    to stop. This makes the stop condition a real lead-count condition,
+    not a raw-job-count condition.
     """
     ctx = pipeline.PipelineContext(
         config=config,
         lead_config=lead_config,
         user_input=user_input,
+        data=raw_jobs.copy() if raw_jobs is not None else pd.DataFrame(),
     )
-    ctx = pipeline.run_pipeline(
-        ctx,
-        pipeline.build_pipeline(collect_jobs, apply_remote_safety_filter, deduplicate),
-    )
+    # Only stages after Job Collection. The final selected leads are
+    # therefore always computed from the entire accumulated job set.
+    stages = pipeline.build_pipeline(collect_jobs, apply_remote_safety_filter, deduplicate)[1:]
+    return pipeline.run_pipeline(ctx, stages)
 
-    # Job-level rows are preserved by the dedup stage for audit; if that
-    # stage did not run, the working set is still job-level.
+
+def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
+                     progress_callback=None) -> dict:
+    """Search locations dynamically until the qualified-lead target is met.
+
+    Core rule:
+
+        STOP when UNIQUE QUALIFIED LEADS >= target_leads.
+
+    The selected region is always searched first. When it does not produce
+    enough leads, the remaining regions are searched in the configured
+    fallback order. The pipeline is re-evaluated after each region so the
+    decision to continue is based on actual lead quality, company
+    deduplication, ICP filtering, contact enrichment and prioritisation.
+    """
+    target_leads = _dynamic_lead_target(config, lead_config)
+    job_buffer = _job_buffer_for_location(config, target_leads)
+
+    # Fresh source cache for every run while still avoiding repeated feed
+    # downloads inside the same run (important for Europe and fallback).
+    job_sources.reset_cache()
+
+    job_title = user_input["job_title"]
+    selected = user_input["region"]
+    expansion = keyword_expansion.KeywordExpander(
+        config.get("keyword_expansion")
+    ).expand(job_title)
+    keyword_list = expansion["keywords"] or [job_title]
+
+    search_order = [selected] + [r for r in REGION_ORDER if r != selected]
+    collected = pd.DataFrame()
+
+    summary = {
+        "selected_region": selected,
+        "keyword_expansion": expansion,
+        "keyword_counts_collected": {k: 0 for k in keyword_list},
+        "regions_searched": [],
+        "regions_skipped": [],
+        "region_stats": {},
+        "filter_totals": {},
+        "dropped_frames": [],
+        "lead_target": target_leads,
+        "job_buffer_per_location": job_buffer,
+    }
+
+    log.info(f"\n[LEAD TARGET] Target: {target_leads} qualified leads")
+    log.info(f"[LOCATION ORDER] { ' -> '.join(search_order) }")
+    log.info(f"[KEYWORDS] Searched title: '{job_title}'")
+    if expansion["expanded"]:
+        log.info(
+            f"           Similar keywords ({len(expansion['expanded'])}): "
+            + ", ".join(f"'{k}'" for k in expansion["expanded"])
+        )
+    else:
+        log.info("           No similar keywords found - searching the title alone.")
+
+    ctx = None
+    previous_lead_count = 0
+
+    for region in search_order:
+        label = "SELECTED" if region == selected else "FALLBACK"
+        if previous_lead_count >= target_leads:
+            summary["regions_skipped"].append(region)
+            continue
+
+        log.info(
+            f"\n[{label}] Region: {region} | current leads "
+            f"{previous_lead_count}/{target_leads} | collecting up to "
+            f"~{job_buffer} remote job rows before lead evaluation"
+        )
+
+        if progress_callback:
+            try:
+                progress_callback({
+                    "stage": "Searching job boards",
+                    "current_region": region,
+                    "target_leads": target_leads,
+                    "current_leads": previous_lead_count,
+                    "regions_searched": list(summary["regions_searched"]),
+                })
+            except Exception:
+                pass
+
+        kept, dropped, filter_stats, stats = search_region(
+            region, job_title, config, job_buffer, keyword_list
+        )
+        summary["regions_searched"].append(region)
+        _merge_region_search_summary(summary, region, kept, dropped, filter_stats, stats, label)
+
+        if not kept.empty:
+            kept = kept.copy()
+            kept["_region"] = region
+            collected = pd.concat([collected, kept], ignore_index=True)
+            collected, _ = deduplicate(collected)
+
+        # Re-evaluate ALL accumulated postings. This is the key change:
+        # a country is only considered successful when the resulting lead
+        # count, not the job count, reaches the target.
+        ctx = _evaluate_accumulated_jobs(collected, user_input, config, lead_config)
+        current_leads = len(ctx.data)
+        previous_lead_count = current_leads
+
+        summary["region_stats"][region]["running_jobs"] = len(collected)
+        summary["region_stats"][region]["running_leads"] = current_leads
+        summary["region_stats"][region]["high_priority_leads"] = int(
+            (ctx.data.get("lead_priority", pd.Series(dtype=str)) == "High").sum()
+        ) if not ctx.data.empty else 0
+        summary["region_stats"][region]["medium_priority_leads"] = int(
+            (ctx.data.get("lead_priority", pd.Series(dtype=str)) == "Medium").sum()
+        ) if not ctx.data.empty else 0
+        summary["region_stats"][region]["low_priority_leads"] = int(
+            (ctx.data.get("lead_priority", pd.Series(dtype=str)) == "Low").sum()
+        ) if not ctx.data.empty else 0
+
+        log.info(
+            f"    {region}: {len(collected)} unique remote jobs accumulated -> "
+            f"{current_leads}/{target_leads} qualified leads"
+        )
+
+        if progress_callback:
+            try:
+                progress_callback({
+                    "stage": "Lead qualification",
+                    "current_region": region,
+                    "target_leads": target_leads,
+                    "current_leads": current_leads,
+                    "regions_searched": list(summary["regions_searched"]),
+                    "high_priority_leads": summary["region_stats"][region]["high_priority_leads"],
+                    "medium_priority_leads": summary["region_stats"][region]["medium_priority_leads"],
+                    "low_priority_leads": summary["region_stats"][region]["low_priority_leads"],
+                })
+            except Exception:
+                pass
+
+        if current_leads >= target_leads:
+            log.info(
+                f"    TARGET REACHED: {current_leads} qualified leads. "
+                "Stopping before the next location."
+            )
+            break
+
+    for region in search_order:
+        if region not in summary["regions_searched"] and region not in summary["regions_skipped"]:
+            summary["regions_skipped"].append(region)
+
+    if ctx is None:
+        ctx = _evaluate_accumulated_jobs(collected, user_input, config, lead_config)
+
+    # Count keyword contribution against the complete collected job set.
+    keyword_counts = {k: 0 for k in keyword_list}
+    if not collected.empty and "search_keyword" in collected.columns:
+        for value in collected["search_keyword"]:
+            keyword_counts[value] = keyword_counts.get(value, 0) + 1
+    summary["keyword_counts_collected"] = keyword_counts
+    summary["keyword_counts"] = keyword_counts
+    summary["dropped_df"] = (
+        pd.concat(summary.pop("dropped_frames"), ignore_index=True)
+        if summary.get("dropped_frames") else pd.DataFrame()
+    )
+    summary["final_lead_count"] = len(ctx.data)
+    summary["target_reached"] = len(ctx.data) >= target_leads
+
+    ctx.add_artifact("search_summary", summary)
+    ctx.add_artifact("dynamic_lead_search", {
+        "target_leads": target_leads,
+        "final_leads": len(ctx.data),
+        "target_reached": len(ctx.data) >= target_leads,
+        "regions_searched": summary["regions_searched"],
+        "regions_skipped": summary["regions_skipped"],
+    })
+
     job_level = ctx.artifacts.get("job_level_data")
     if job_level is None:
         job_level = ctx.data
 
+    # The main business output is the final 50 leads. The job audit sheet
+    # can still be capped independently at target_total_jobs.
     jobs_sheet = cap_and_reshape(job_level, config["target_total_jobs"])
     leads_sheet = shape_lead_sheet(ctx.data)
 
@@ -1076,25 +1498,46 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict) -> dict:
     if lead_config["save_excluded_companies"]:
         excluded_path = export_excluded_companies(excluded, config["output_dir"])
 
-    summary = ctx.artifacts.get("search_summary")
-    if summary:
-        summary["dedup_counts"] = ctx.artifacts.get(
-            "job_dedup_counts",
-            {"by_url": 0, "by_fallback_key": 0, "by_title_company": 0},
-        )
-        if "_region" in job_level.columns:
-            capped = job_level.head(config["target_total_jobs"])["_region"].tolist()
-        else:
-            capped = []
-        counts = {}
-        for region in capped:
-            counts[region] = counts.get(region, 0) + 1
-        summary["export_region_counts"] = counts
+    # Export/audit metrics are based on exactly the rows that were written.
+    summary["dedup_counts"] = ctx.artifacts.get(
+        "job_dedup_counts",
+        {"by_url": 0, "by_fallback_key": 0, "by_title_company": 0},
+    )
+    capped_rows = job_level.head(config["target_total_jobs"])
+    if "_region" in job_level.columns:
+        capped = capped_rows["_region"].tolist()
+    else:
+        capped = []
+    counts = {}
+    for region in capped:
+        counts[region] = counts.get(region, 0) + 1
+    summary["export_region_counts"] = counts
+
+    keyword_counts_export = {k: 0 for k in expansion.get("keywords", [])}
+    if "search_keyword" in capped_rows.columns:
+        for value in capped_rows["search_keyword"]:
+            keyword_counts_export[value] = keyword_counts_export.get(value, 0) + 1
+    summary["keyword_counts"] = keyword_counts_export
 
     dedup_stats = ctx.artifacts.get("company_dedup_stats", {})
     icp_stats = ctx.artifacts.get("icp_stats", {})
     contact_stats = ctx.artifacts.get("contact_stats", {})
     selection = ctx.artifacts.get("selection_stats", {})
+
+    if progress_callback:
+        try:
+            progress_callback({
+                "stage": "Completed",
+                "target_leads": target_leads,
+                "current_leads": len(leads_sheet),
+                "regions_searched": summary["regions_searched"],
+                "regions_skipped": summary["regions_skipped"],
+                "high_priority_leads": selection.get("priority_counts", {}).get("High", 0),
+                "medium_priority_leads": selection.get("priority_counts", {}).get("Medium", 0),
+                "low_priority_leads": selection.get("priority_counts", {}).get("Low", 0),
+            })
+        except Exception:
+            pass
 
     return {
         "ctx": ctx,
@@ -1125,8 +1568,8 @@ def main():
         ctx = result["ctx"]
 
         if result["summary"]:
-            print_summary(result["summary"], result["jobs_count"],
-                          config["target_total_jobs"], config["remote_strictness"])
+            print_summary(result["summary"], result["leads_count"],
+                          lead_config["target_leads"], config["remote_strictness"])
         else:
             print("\n[WARN] Job collection did not complete - no search summary to report.")
 

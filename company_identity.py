@@ -37,6 +37,10 @@ from urllib.parse import urlparse
 AGGREGATOR_DOMAINS = {
     "linkedin.com", "indeed.com", "glassdoor.com", "google.com",
     "ziprecruiter.com", "naukri.com", "bayt.com", "bdjobs.com",
+    # Dedicated remote-job boards (job_sources.py). None of these are a
+    # company's own site, so - same as the boards above - a bare domain
+    # match here must never stand in for a real company identity.
+    "remoteok.com", "remotive.com", "weworkremotely.com", "jobspresso.co",
 }
 
 # Legal-entity suffixes stripped before comparing names. These mark the

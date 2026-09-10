@@ -11,8 +11,9 @@
     <header class="header">
       <h1>Remote AI Job Search Engine</h1>
       <p class="subtitle">
-        Search Indeed, LinkedIn and Google Jobs for remote roles, then export a
-        company-level lead list to Excel.
+        Search Indeed, LinkedIn, RemoteOK, Remotive, We Work Remotely and
+        Jobspresso for remote roles, then export a company-level lead list to
+        Excel.
       </p>
     </header>
 
@@ -40,9 +41,14 @@
           </div>
         </fieldset>
 
-        <button type="submit" id="start-button" class="button-primary">
-          Start job search
-        </button>
+        <div class="button-row">
+          <button type="submit" id="start-button" class="button-primary">
+            Start job search
+          </button>
+          <button type="button" id="dictionary-button" class="button-secondary">
+            View excluded-company dictionary
+          </button>
+        </div>
         <p class="hint">
           A full run takes several minutes. You can leave this page open while it works.
         </p>
@@ -86,6 +92,18 @@
       <button type="button" id="download-button" class="button-primary" hidden>
         Download Excel file
       </button>
+    </section>
+
+
+    <section class="card dictionary-card" id="dictionary-card" hidden aria-labelledby="dictionary-heading">
+      <div class="dictionary-header">
+        <div>
+          <h2 id="dictionary-heading" class="card-title">Low-probability buyer dictionary</h2>
+          <p class="dictionary-note" id="dictionary-note"></p>
+        </div>
+        <button type="button" id="dictionary-close" class="button-link">Close</button>
+      </div>
+      <div id="dictionary-content"></div>
     </section>
 
     <footer class="footer">

@@ -236,6 +236,130 @@ input[type="text"]:focus-visible,
   margin-top: 0.15rem;
 }
 
+.button-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.6rem;
+}
+
+.button-secondary {
+  width: 100%;
+  padding: 0.72rem 1rem;
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.button-secondary:hover { border-color: var(--accent); }
+
+.dictionary-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.dictionary-note {
+  margin: -0.7rem 0 1rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.button-link {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0.2rem;
+}
+
+.dictionary-grid {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.dictionary-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.9rem;
+}
+
+.dictionary-item-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.dictionary-item h3, .watchlist-section h3 {
+  margin: 0 0 0.25rem;
+  font-size: 0.96rem;
+}
+
+.dictionary-item p {
+  margin: 0.35rem 0 0.65rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.probability {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.dictionary-key {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.dictionary-item summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+
+.pattern-list {
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.6;
+}
+
+.watchlist-section {
+  margin-top: 1.25rem;
+}
+
+.watchlist {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.watchlist-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 1fr) minmax(120px, 0.7fr) minmax(200px, 1.8fr);
+  gap: 0.7rem;
+  padding: 0.7rem 0.8rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.78rem;
+}
+
+.watchlist-row:first-child { border-top: 0; }
+.watchlist-row span { color: var(--muted); }
+.watchlist-empty { color: var(--muted); font-size: 0.84rem; margin-top: 1rem; }
+
+@media (max-width: 600px) {
+  .watchlist-row { grid-template-columns: 1fr; gap: 0.2rem; }
+}
+
 .footer { text-align: center; }
 
 .api-target {

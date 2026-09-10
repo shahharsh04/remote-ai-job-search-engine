@@ -32,6 +32,8 @@ from pydantic import BaseModel, Field
 
 import main as engine
 import pipeline
+import icp
+import excluded_company_store
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("job_search")
@@ -59,6 +61,7 @@ app.add_middleware(
 # runs ever needed to survive a redeploy.
 RUNS = {}
 RUNS_LOCK = threading.Lock()
+LAST_EXCLUDED_COMPANIES = []
 
 VALID_REGIONS = engine.REGION_ORDER
 
@@ -82,17 +85,45 @@ def _run_search(run_id: str, job_title: str, region: str) -> None:
         config = engine.load_config(os.getenv("CONFIG_PATH", "config.yaml"))
         lead_config = pipeline.load_lead_config(config)
 
-        _set(run_id, stage="Searching job boards")
+        _set(run_id, stage="Searching job boards", target_leads=lead_config.get("target_leads", 50), current_leads=0, regions_searched=[])
+
+        def progress(update):
+            # Keep the browser informed while the long-running search
+            # moves from one location to the next and then through the
+            # lead-qualification stages.
+            if isinstance(update, dict):
+                _set(run_id, **update)
+
         result = engine.execute_pipeline(
             {"job_title": job_title, "region": region, "remote_only": True},
             config,
             lead_config,
+            progress_callback=progress,
         )
+
+        # The keywords actually searched, so the page can show why a job
+        # it did not literally ask for is in the file.
+        search_summary = result.get("summary") or {}
+        expansion = search_summary.get("keyword_expansion") or {}
+
+        ctx = result.get("ctx")
+        excluded_watchlist = []
+        if ctx is not None:
+            excluded_watchlist = list(ctx.artifacts.get("excluded_company_watchlist", []))
+
+        global LAST_EXCLUDED_COMPANIES
+        with RUNS_LOCK:
+            LAST_EXCLUDED_COMPANIES = excluded_watchlist
+            if run_id in RUNS:
+                RUNS[run_id]["excluded_company_watchlist"] = excluded_watchlist
 
         _set(
             run_id,
             status="completed",
             stage="Done",
+            keywords_searched=expansion.get("keywords", [job_title]),
+            similar_keywords=expansion.get("expanded", []),
+            keyword_counts=search_summary.get("keyword_counts", {}),
             finished_at=datetime.now().isoformat(timespec="seconds"),
             output_path=result["output_path"],
             jobs_found=result["jobs_count"],
@@ -103,6 +134,10 @@ def _run_search(run_id: str, job_title: str, region: str) -> None:
             contacts_found=result["contacts_found"],
             contacts_not_found=result["contacts_not_found"],
             priority_counts=result["priority_counts"],
+            target_leads=search_summary.get("lead_target", lead_config.get("target_leads", 50)),
+            target_reached=search_summary.get("target_reached", False),
+            regions_searched=search_summary.get("regions_searched", []),
+            regions_skipped=search_summary.get("regions_skipped", []),
         )
     except Exception as exc:
         log.warning(f"[ERROR] run {run_id} failed: {exc}")
@@ -142,6 +177,32 @@ def health():
         "status": "ok",
         "regions": VALID_REGIONS,
         "allowed_origins": allowed_origins,
+    }
+
+
+@app.get("/api/exclusion-dictionary")
+def exclusion_dictionary():
+    """Return reusable rules and the permanently accumulated JSON company dictionary."""
+    config_path = os.getenv("CONFIG_PATH", "config.yaml")
+    try:
+        config = engine.load_config(config_path)
+        lead_config = pipeline.load_lead_config(config)
+        dictionary_path = lead_config.get("excluded_company_dictionary_path", "data/excluded_companies.json")
+    except Exception:
+        dictionary_path = os.getenv("EXCLUDED_COMPANY_DICTIONARY_PATH", "data/excluded_companies.json")
+
+    permanent = excluded_company_store.all_companies(dictionary_path)
+    return {
+        "categories": icp.exclusion_dictionary(),
+        "persistent_excluded_companies": permanent,
+        "persistent_company_count": len(permanent),
+        "last_run_excluded_companies": list(LAST_EXCLUDED_COMPANIES),
+        "dictionary_path": dictionary_path,
+        "note": (
+            "Companies in the persistent dictionary accumulate across runs. They are prospecting filters, "
+            "not absolute claims about future buying behavior. A company is excluded when its identity is already "
+            "in the dictionary or its current company data matches a configured exclusion rule."
+        ),
     }
 
 

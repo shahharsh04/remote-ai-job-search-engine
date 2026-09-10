@@ -201,41 +201,29 @@ async function loadExclusionDictionary() {
   try {
     const response = await fetch(`${API_BASE}/api/exclusion-dictionary`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
     const data = await response.json();
-    dictionaryNote.textContent = data.note || "";
+    const companies = data.companies || [];
+    const count = data.company_count ?? companies.length;
 
-    const categories = data.categories || {};
-    const cards = Object.entries(categories).map(([key, item]) => {
-      const patterns = (item.patterns || []).join(", ");
-      return `
-        <article class="dictionary-item">
-          <div class="dictionary-item-top">
-            <div>
-              <h3>${escapeHtml(item.label || key)}</h3>
-              <span class="probability">${escapeHtml(item.buy_probability || "Low")}</span>
-            </div>
-            <span class="dictionary-key">${escapeHtml(key)}</span>
-          </div>
-          <p>${escapeHtml(item.reason || "")}</p>
-          <details>
-            <summary>Matching phrases</summary>
-            <div class="pattern-list">${escapeHtml(patterns)}</div>
-          </details>
-        </article>`;
-    }).join("");
+    dictionaryNote.textContent = data.note ||
+      "Companies accumulate here permanently across runs and are filtered before lead selection.";
 
-    const excluded = data.persistent_excluded_companies || [];
-    const excludedHtml = excluded.length
-      ? `<div class="watchlist-section"><h3>Permanent excluded-company dictionary (${excluded.length})</h3><p class="dictionary-note">These companies are saved in the JSON dictionary and remain available on future runs.</p><div class="watchlist">${excluded.map(item => `
+    const rows = companies.length
+      ? companies.map((item) => `
           <div class="watchlist-row">
             <strong>${escapeHtml(item.company_name || "Unknown company")}</strong>
-            <span>${escapeHtml(item.category || "Unknown")}</span>
-            <span>${escapeHtml(item.reason || "Excluded by ICP rule")}</span>
-            <small>Seen ${escapeHtml(item.times_seen || 1)} time(s)</small>
-          </div>`).join("")}</div></div>`
-      : `<div class="watchlist-empty">The permanent dictionary is empty. Newly excluded companies will be saved here automatically.</div>`;
+            <span>${escapeHtml(item.category || "Low-probability buyer")}</span>
+            <span>${escapeHtml(item.reason || "Added by the low-probability buyer filter.")}</span>
+            <small>Added ${escapeHtml(item.first_seen || "Unknown")} · Seen ${escapeHtml(item.times_seen || 1)} time(s)</small>
+          </div>`).join("")
+      : `<div class="watchlist-empty">No companies have been added yet. Companies identified during a search will be saved here automatically.</div>`;
 
-    dictionaryContent.innerHTML = `<div class="dictionary-grid">${cards}</div>${excludedHtml}`;
+    dictionaryContent.innerHTML = `
+      <div class="watchlist-section">
+        <h3>${escapeHtml(data.dictionary_name || "Low-probability buyer dictionary")} (${count})</h3>
+        <div class="watchlist">${rows}</div>
+      </div>`;
     dictionaryCard.hidden = false;
   } catch (error) {
     dictionaryContent.innerHTML = `<div class="watchlist-empty">Could not load the dictionary. Make sure the backend is running.</div>`;

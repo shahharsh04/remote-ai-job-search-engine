@@ -353,6 +353,12 @@ def score_company(company: dict, lead_config: dict) -> dict:
     else:
         priority = "Low"
 
+    # Business-facing priority tiers are intentionally promoted one step:
+    # High stays High, Medium becomes High, and Low becomes Medium.
+    # This changes only the displayed/selected lead tier; the numeric
+    # priority score remains unchanged for transparency.
+    priority = {"High": "High", "Medium": "High", "Low": "Medium"}.get(priority, priority)
+
     return {
         "priority_score": normalised,
         "lead_priority": priority,

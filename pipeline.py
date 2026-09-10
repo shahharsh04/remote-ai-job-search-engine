@@ -668,39 +668,19 @@ class IcpFilteringStage(Stage):
                     dictionary_path,
                 )
 
+        # The only reusable exclusion list is the persistent JSON dictionary.
+        # It is cumulative across runs: companies found in Run 1 are loaded
+        # before Run 2 and excluded before they can become leads.
+        ctx.add_artifact(
+            "persistent_excluded_companies",
+            excluded_company_store.all_companies(dictionary_path),
+        )
         if persistent_matches:
             ctx.add_artifact("persistent_dictionary_matches", persistent_matches)
 
         if not excluded.empty:
             ctx.append_excluded(excluded, self.name, "excluded by ICP rules")
             log.info(f"      excluded {len(excluded)} competitor companies")
-
-            # Keep a compact, reviewable company-level watchlist for the
-            # UI. This is separate from the reusable rule dictionary in
-            # icp.py, so users can see both the rules and the actual
-            # companies removed in the current run.
-            excluded_rows = []
-            for record in excluded.to_dict("records"):
-                excluded_rows.append({
-                    "company_name": record.get("company_name", ""),
-                    "company_domain": record.get("company_domain", ""),
-                    "company_type": record.get("company_type", "Unknown"),
-                    "exclusion_reason": record.get("exclusion_reason", ""),
-                })
-            existing_watchlist = ctx.artifacts.get("persistent_dictionary_matches", [])
-            combined = existing_watchlist + excluded_rows
-            seen = set()
-            deduped_watchlist = []
-            for item in combined:
-                key = (str(item.get("company_domain") or "").lower(), str(item.get("company_name") or "").lower())
-                if key not in seen:
-                    seen.add(key)
-                    deduped_watchlist.append(item)
-            ctx.add_artifact("excluded_company_watchlist", deduped_watchlist)
-        else:
-            ctx.add_artifact("excluded_company_watchlist", ctx.artifacts.get("persistent_dictionary_matches", []))
-
-        ctx.add_artifact("persistent_excluded_companies", excluded_company_store.all_companies(dictionary_path))
 
         unknown_size = int((kept["company_size"] == icp.UNKNOWN).sum())
         if unknown_size:

@@ -182,26 +182,36 @@ def health():
 
 @app.get("/api/exclusion-dictionary")
 def exclusion_dictionary():
-    """Return reusable rules and the permanently accumulated JSON company dictionary."""
+    """Return the single persistent low-probability buyer dictionary.
+
+    The JSON file is cumulative across pipeline runs. A company added during
+    one run remains in this dictionary and is checked before lead creation on
+    later runs.
+    """
     config_path = os.getenv("CONFIG_PATH", "config.yaml")
     try:
         config = engine.load_config(config_path)
         lead_config = pipeline.load_lead_config(config)
-        dictionary_path = lead_config.get("excluded_company_dictionary_path", "data/excluded_companies.json")
+        dictionary_path = lead_config.get(
+            "excluded_company_dictionary_path",
+            "data/excluded_companies.json",
+        )
     except Exception:
-        dictionary_path = os.getenv("EXCLUDED_COMPANY_DICTIONARY_PATH", "data/excluded_companies.json")
+        dictionary_path = os.getenv(
+            "EXCLUDED_COMPANY_DICTIONARY_PATH",
+            "data/excluded_companies.json",
+        )
 
-    permanent = excluded_company_store.all_companies(dictionary_path)
+    companies = excluded_company_store.all_companies(dictionary_path)
     return {
-        "categories": icp.exclusion_dictionary(),
-        "persistent_excluded_companies": permanent,
-        "persistent_company_count": len(permanent),
-        "last_run_excluded_companies": list(LAST_EXCLUDED_COMPANIES),
+        "dictionary_name": "Low-probability buyer dictionary",
+        "companies": companies,
+        "company_count": len(companies),
         "dictionary_path": dictionary_path,
         "note": (
-            "Companies in the persistent dictionary accumulate across runs. They are prospecting filters, "
-            "not absolute claims about future buying behavior. A company is excluded when its identity is already "
-            "in the dictionary or its current company data matches a configured exclusion rule."
+            "This is one permanent cumulative dictionary. Companies added in one run "
+            "remain available for every later run and are excluded before they can be "
+            "selected as leads. New low-probability companies are added automatically."
         ),
     }
 

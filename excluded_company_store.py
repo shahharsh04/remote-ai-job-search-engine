@@ -105,6 +105,10 @@ def add(record: dict, category: str, reason: str, path: str | Path | None = None
         else:
             match["last_seen"] = now
             match["times_seen"] = int(match.get("times_seen") or 0) + 1
+            if company_name and not match.get("company_name"):
+                match["company_name"] = company_name
+            if domain and not match.get("company_domain"):
+                match["company_domain"] = domain
             if category and not match.get("category"):
                 match["category"] = category
             if reason and not match.get("reason"):

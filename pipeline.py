@@ -91,7 +91,7 @@ LEAD_CONFIG_DEFAULTS = {
         # Fetch the company's own public careers page over plain HTTP.
         "enable_careers_page_lookup": True,
         "respect_robots_txt": True,
-        "request_timeout_seconds": 8,
+        "request_timeout_seconds": 5,
         # Enrichment makes network calls, so it is budgeted.
         "max_companies_to_enrich": 20,
         # How many companies' careers-page lookups run at once (bounded
@@ -101,6 +101,10 @@ LEAD_CONFIG_DEFAULTS = {
         # Raise for faster runs on a good connection; lower it back
         # toward 1 to fully serialize requests again if ever needed.
         "max_concurrent_requests": 10,
+        # HARD ceiling on the whole stage, not scaled by company count -
+        # see ContactEnrichmentStage._run for why a scaled bound is not
+        # enough on its own.
+        "enrichment_stage_timeout_seconds": 300,
         # LinkedIn *search* links, not profiles - see contacts.py.
         "generate_linkedin_search_urls": True,
         "user_agent": "RemoteJobSearchEngine/1.0 (lead research)",
@@ -819,15 +823,19 @@ class ContactEnrichmentStage(Stage):
         # its own timeout (request_timeout_seconds, default 8s), so this
         # is a second, defense-in-depth bound on the STAGE as a whole -
         # in case a company's DNS lookup or connection stalls in a way an
-        # individual call's read-timeout does not fully cover. Same
-        # "never wait forever" reasoning as main.PLATFORM_FETCH_TIMEOUT_
-        # SECONDS: still generous enough for a legitimately large
-        # enrichment budget to finish (worst case ~8 requests/company at
-        # 8s each), but the stage can never hang the whole pipeline.
-        stage_timeout = settings.get(
-            "enrichment_stage_timeout_seconds",
-            max(120, int(settings.get("request_timeout_seconds", 8)) * 9 * max(1, len(to_enrich) // workers + 1)),
-        )
+        # individual call's read-timeout does not fully cover.
+        #
+        # This is a HARD, FIXED cap - not scaled by company count. An
+        # earlier version of this scaled with max_companies_to_enrich and
+        # could reach ~37 minutes in a legitimate worst case (many
+        # companies with unresponsive sites): technically bounded, but
+        # indistinguishable from a hang to anyone waiting on it, and the
+        # actual reported symptom on a real deployment. A company still
+        # queued when this fires is reported honestly as "Not attempted"
+        # rather than fabricated - consistent with this project's "report
+        # what's real, never pad" rule, same as the enrichment budget
+        # (max_companies_to_enrich) itself already works.
+        stage_timeout = int(settings.get("enrichment_stage_timeout_seconds", 300))
         if to_enrich:
             import concurrent.futures
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)

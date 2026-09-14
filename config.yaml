@@ -55,6 +55,19 @@ results_wanted_per_platform: 100
 # companies before a country's available results are exhausted.
 max_pages_per_platform: 10
 
+# How many of the configured platforms are fetched concurrently for one
+# query (Indeed, LinkedIn, ZipRecruiter, Glassdoor, RemoteOK, Remotive,
+# We Work Remotely, Jobspresso - 8 total). Concurrency is what fixed
+# runs that previously took well over an hour purely from fetching
+# platforms one after another, but running all 8 at once was observed to
+# make the API's own trivial endpoints (health check, starting a new
+# search) time out while a search was active, on a resource-constrained
+# host. Only Indeed and LinkedIn are genuinely slow, so 4 still lets both
+# run alongside the fast ones without needing every thread at once.
+# Raise this on a host with more CPU headroom; the ceiling is 8 (no
+# benefit past the number of configured platforms).
+platform_fetch_concurrency: 4
+
 # Maximum number of rows in the "Remote Jobs" audit sheet (and the raw
 # job-posting count reported in logs/summaries). If fewer genuine remote
 # postings exist after filtering, the output will have fewer rows rather
@@ -275,22 +288,40 @@ lead_pipeline:
     # Turn off to keep the run offline apart from the job boards.
     enable_careers_page_lookup: true
     respect_robots_txt: true
-    request_timeout_seconds: 8
-    # Enrichment makes network calls, so it is budgeted per run. Raised
-    # alongside MAX_COMPANIES so a large run doesn't report "Contact: Not
-    # Found" for hundreds of companies purely because of this budget;
-    # raise further if you regularly export close to MAX_COMPANIES and
-    # can tolerate the extra network time.
-    max_companies_to_enrich: 300
+    # Per-HTTP-call timeout. Lowered from 8s: with up to 5 requests per
+    # company (1 robots.txt + up to 4 candidate paths - see
+    # contacts.CAREERS_PATHS), 8s made the true worst case per company
+    # ~40s: on a resource-constrained host, hundreds of unresponsive
+    # sites at that cost was enough to make the whole enrichment stage
+    # look hung even though every individual call was bounded.
+    request_timeout_seconds: 5
+    # Enrichment makes network calls, so it is budgeted per run. Lowered
+    # back from an earlier 300: at up to ~25s worst case per company (5
+    # requests x 5s) and enrichment_stage_timeout_seconds below, 300
+    # companies could realistically need more time than the stage is
+    # allowed - meaning many would go "Not attempted" regardless. 100
+    # comfortably fits the stage timeout in the typical case (most sites
+    # answer, or fail, in far less than the worst case) while still far
+    # exceeding the original default of 20.
+    max_companies_to_enrich: 100
     # How many companies' careers-page lookups run at once. Each request
     # targets a different company's own domain (plus one robots.txt fetch
     # per company, cached - see contacts.py), so this is a wall-clock
     # optimization, not a rate-limit bypass against any single site.
-    # Running max_companies_to_enrich (300) fully sequentially was one of
-    # the two biggest contributors to multi-hour runs; 10 concurrent
-    # requests cuts that roughly tenfold. Lower it toward 1 if you need
-    # fully serialized requests for some reason.
+    # Running max_companies_to_enrich fully sequentially was one of the
+    # two biggest contributors to multi-hour runs; 10 concurrent requests
+    # cuts that roughly tenfold. Lower it toward 1 if you need fully
+    # serialized requests, or if a resource-constrained host (e.g. a
+    # small cloud instance) shows contention with this many threads.
     max_concurrent_requests: 10
+    # HARD, FIXED ceiling (not scaled by max_companies_to_enrich) on how
+    # long the whole enrichment stage may run - the fix for a run that
+    # takes "technically bounded but over an hour anyway": an earlier
+    # version of this scaled with company count and could reach ~37
+    # minutes in a legitimate worst case. Any company still queued when
+    # this fires is reported "Not attempted" rather than waited on
+    # further - honest, not padded, same as the budget above.
+    enrichment_stage_timeout_seconds: 300
     # LinkedIn *search* links for recruiter titles. These are research
     # links, never claimed profiles - profiles cannot be read without
     # scraping behind a login, which this project does not do.

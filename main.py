@@ -175,6 +175,11 @@ def load_config(path: str) -> dict:
     except (TypeError, ValueError):
         log.warning("[WARN] search_timeout_seconds is not a number - using 1800.")
         config["search_timeout_seconds"] = 1800
+    # How many platforms are fetched at once per query - see
+    # DEFAULT_MAX_CONCURRENT_PLATFORMS's comment for why this defaults to
+    # 4 (not all 8 configured platforms at once) on a resource-
+    # constrained host. Raise it on a host with more CPU headroom.
+    config.setdefault("platform_fetch_concurrency", DEFAULT_MAX_CONCURRENT_PLATFORMS)
 
     # Similar-title keyword expansion. Normalised here so every caller -
     # CLI, API, or a script importing this module - sees a complete
@@ -482,10 +487,20 @@ def _fetch_and_filter_platform(platform: str, keyword: str, location: str,
 # rate-limit bypass against any single platform - and was one of two
 # fixes (the other is ContactEnrichmentStage's concurrency) for runs
 # that previously took well over an hour purely from doing independent,
-# unrelated network calls strictly one after another. Capped at 8 since
-# there are at most 8 configured platforms; raising it further would do
-# nothing.
-MAX_CONCURRENT_PLATFORMS = 8
+# unrelated network calls strictly one after another.
+#
+# Kept at 4, not 8 (all configured platforms at once): on a resource-
+# constrained host (e.g. a small cloud instance), even I/O-bound Python
+# threads compete for the GIL and a shared thread pool, and running
+# every platform at once was observed to make the API's own trivial
+# endpoints (health checks, starting a new search) time out while a
+# search was active - not a hang, but bad enough to look like one. Only
+# Indeed and LinkedIn are genuinely slow (ZipRecruiter/Glassdoor fail
+# fast; the dedicated boards are cached in-memory feed lookups), so 4
+# still lets both of the slow ones run alongside the fast ones without
+# needing all 8 threads at once. Configurable via
+# config.yaml's platform_fetch_concurrency.
+DEFAULT_MAX_CONCURRENT_PLATFORMS = 4
 
 # PLATFORM_FETCH_TIMEOUT_SECONDS: the real fix for a run that hangs
 # indefinitely rather than merely running long. JobSpy's own scrape_jobs()
@@ -510,8 +525,9 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
                               config: dict) -> tuple[pd.DataFrame, dict]:
     """Search every configured platform for one keyword in one country.
 
-    Platforms are fetched concurrently (see MAX_CONCURRENT_PLATFORMS) -
-    the only change from the original sequential version - then logged
+    Platforms are fetched concurrently (see config["platform_fetch_
+    concurrency"] / DEFAULT_MAX_CONCURRENT_PLATFORMS) - the main change
+    from the original sequential version - then logged
     and assembled in the configured platform order for a deterministic,
     reproducible summary regardless of which platform happened to finish
     first. Every row is re-checked against the selected country before
@@ -529,7 +545,8 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
     platforms = config["platforms"]
 
     fetched = {}
-    workers = max(1, min(MAX_CONCURRENT_PLATFORMS, len(platforms)))
+    concurrency = config.get("platform_fetch_concurrency", DEFAULT_MAX_CONCURRENT_PLATFORMS)
+    workers = max(1, min(int(concurrency), len(platforms)))
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     try:
         future_to_platform = {

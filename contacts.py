@@ -73,7 +73,13 @@ LINKEDIN_SEARCH_TITLES = [
     "Hiring Manager",
 ]
 
-CAREERS_PATHS = ["/careers", "/careers/", "/jobs", "/company/careers", "/about/careers"]
+# "/careers/" (trailing slash) was dropped: on the same site it almost
+# always resolves to the same page as "/careers" (one extra redirect at
+# most), so it was paying a full request+timeout for no real coverage
+# gain - one of several contributors to the per-company worst case that
+# made contact enrichment the other big source of a run taking well over
+# an hour (see pipeline.ContactEnrichmentStage).
+CAREERS_PATHS = ["/careers", "/jobs", "/company/careers", "/about/careers"]
 
 
 def _clean(value) -> str:

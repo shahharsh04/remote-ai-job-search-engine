@@ -815,14 +815,31 @@ class ContactEnrichmentStage(Stage):
         # request still targets a different company's own domain).
         to_enrich = [(i, r) for i, r in enumerate(records) if i < limit]
         workers = max(1, int(settings.get("max_concurrent_requests", 10)))
+        # Every individual HTTP call inside contacts.py already carries
+        # its own timeout (request_timeout_seconds, default 8s), so this
+        # is a second, defense-in-depth bound on the STAGE as a whole -
+        # in case a company's DNS lookup or connection stalls in a way an
+        # individual call's read-timeout does not fully cover. Same
+        # "never wait forever" reasoning as main.PLATFORM_FETCH_TIMEOUT_
+        # SECONDS: still generous enough for a legitimately large
+        # enrichment budget to finish (worst case ~8 requests/company at
+        # 8s each), but the stage can never hang the whole pipeline.
+        stage_timeout = settings.get(
+            "enrichment_stage_timeout_seconds",
+            max(120, int(settings.get("request_timeout_seconds", 8)) * 9 * max(1, len(to_enrich) // workers + 1)),
+        )
         if to_enrich:
             import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+            try:
                 future_to_index = {
                     pool.submit(contacts.enrich_company, record, ctx.lead_config): index
                     for index, record in to_enrich
                 }
-                for future in concurrent.futures.as_completed(future_to_index):
+                done, not_done = concurrent.futures.wait(
+                    future_to_index.keys(), timeout=stage_timeout
+                )
+                for future in done:
                     index = future_to_index[future]
                     try:
                         results[index] = future.result()
@@ -837,6 +854,26 @@ class ContactEnrichmentStage(Stage):
                             ),
                             contact_sources_checked=f"Enrichment failed: {exc}",
                         )
+                for future in not_done:
+                    # Still running past the bound - Python cannot force-
+                    # kill a running thread, so it is abandoned (its
+                    # eventual result, if any, is simply discarded)
+                    # rather than waited on any further.
+                    index = future_to_index[future]
+                    log.warning(
+                        f"      [WARN] contact enrichment for a company exceeded "
+                        f"{stage_timeout}s - reporting Not Found rather than blocking."
+                    )
+                    results[index] = dict(
+                        not_attempted,
+                        contact_search_urls=contacts.linkedin_search_urls(
+                            str(records[index].get("company_name") or ""),
+                            settings.get("generate_linkedin_search_urls", True),
+                        ),
+                        contact_sources_checked="Not attempted (enrichment stage timeout)",
+                    )
+            finally:
+                pool.shutdown(wait=False)
 
         for field in ("contact_name", "contact_title", "contact_email",
                       "contact_email_secondary", "contact_linkedin_url",

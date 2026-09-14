@@ -487,6 +487,24 @@ def _fetch_and_filter_platform(platform: str, keyword: str, location: str,
 # nothing.
 MAX_CONCURRENT_PLATFORMS = 8
 
+# PLATFORM_FETCH_TIMEOUT_SECONDS: the real fix for a run that hangs
+# indefinitely rather than merely running long. JobSpy's own scrape_jobs()
+# call - unlike every other HTTP call in this project - has no timeout we
+# control; on some networks (observed: a cloud host's outbound IP treated
+# differently by a job board's anti-bot system than a developer machine)
+# the underlying request can block forever with neither a result nor an
+# exception. Before platform-level concurrency, a hang like that stalled
+# one platform at a time; with concurrency, waiting on every platform's
+# future with no bound at all meant ONE hung platform blocked the whole
+# query indefinitely - and since OVERALL_SEARCH_TIMEOUT is only checked
+# BETWEEN queries, a hang inside one query defeats it entirely. This
+# timeout bounds how long one query waits on its platforms combined:
+# generous enough for LinkedIn's own ~1-3 minute pacing, short enough
+# that a genuinely stuck platform can never block the run for the rest
+# of the configured timeout. A platform that times out is treated as
+# "no results this query" and logged - never a crash, never silence.
+PLATFORM_FETCH_TIMEOUT_SECONDS = 240
+
 
 def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
                               config: dict) -> tuple[pd.DataFrame, dict]:
@@ -499,6 +517,11 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
     first. Every row is re-checked against the selected country before
     being kept - see apply_country_lock_filter (STRICT COUNTRY LOCK /
     Country Validation).
+
+    Waiting on the platforms is itself bounded (PLATFORM_FETCH_TIMEOUT_
+    SECONDS) - see that constant's comment for why this, not just
+    OVERALL_SEARCH_TIMEOUT, is required to guarantee the run can never
+    hang indefinitely.
     """
     location = entry["location"]
     country_indeed = entry["country_indeed"]
@@ -507,7 +530,8 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
 
     fetched = {}
     workers = max(1, min(MAX_CONCURRENT_PLATFORMS, len(platforms)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
         future_to_platform = {
             pool.submit(
                 _fetch_and_filter_platform, platform, keyword, location,
@@ -515,7 +539,10 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
             ): platform
             for platform in platforms
         }
-        for future in concurrent.futures.as_completed(future_to_platform):
+        done, not_done = concurrent.futures.wait(
+            future_to_platform.keys(), timeout=PLATFORM_FETCH_TIMEOUT_SECONDS
+        )
+        for future in done:
             platform = future_to_platform[future]
             try:
                 _, df, stats = future.result()
@@ -528,6 +555,27 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
                     "kept": 0, "pages": 0, "requests": 0,
                 }
             fetched[platform] = (df, stats)
+        for future in not_done:
+            # Still running past the bound - almost always JobSpy's own
+            # network call blocked with no result or error. Python cannot
+            # forcibly kill a running thread, so this thread is abandoned
+            # (it may still finish later and its result is simply
+            # discarded) rather than waited on any further.
+            platform = future_to_platform[future]
+            log.warning(
+                f"    [WARN] {platform}: exceeded {PLATFORM_FETCH_TIMEOUT_SECONDS}s "
+                "(no response, no error - treated as no results for this query, "
+                "rather than blocking the whole run)."
+            )
+            fetched[platform] = (pd.DataFrame(), {
+                "raw": 0, "stale_dropped": 0, "invalid_country": 0,
+                "kept": 0, "pages": 0, "requests": 1,
+            })
+    finally:
+        # wait=False: never block exit on an abandoned/hung thread - that
+        # would silently reintroduce the exact hang this timeout exists
+        # to prevent.
+        pool.shutdown(wait=False)
 
     frames = []
     platform_stats = {}

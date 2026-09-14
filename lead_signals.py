@@ -325,20 +325,35 @@ SCORERS = [
 
 
 def score_company(company: dict, lead_config: dict) -> dict:
-    """Total the factors and assign a priority band."""
+    """Total the factors, assign a priority band, and a Buyer Probability.
+
+    Buyer Probability and Lead Priority are related but distinct:
+      - Buyer Probability is the plain, un-promoted classification
+        (High/Medium/Low from the score thresholds alone), and is what
+        the Low Probability Buyer Dictionary caps at "Low" - see below.
+      - Lead Priority is the existing business-facing tier, promoted one
+        step for action-orientation (unchanged from before this change).
+    """
     scoring = lead_config.get("scoring") or {}
     weights = scoring.get("weights") or {}
     bands = scoring.get("priority_bands") or {}
 
     total = 0
     reasons = []
+    factor_points = {}
     for scorer in SCORERS:
         points, reason = scorer(company, weights)
+        factor_points[scorer.__name__] = points
         total += points
         if points:
             reasons.append(f"{reason} (+{points})")
         elif reason:
             reasons.append(reason)
+
+    # ICP Fit Score: the raw points earned from the size/ICP-fit factor
+    # alone (out of its configured weight), exported as its own column so
+    # a reviewer can see fit separately from the blended total.
+    icp_fit_score = factor_points.get("_score_icp_fit", 0)
 
     max_possible = sum(weights.values()) or 1
     normalised = round(100 * total / max_possible)
@@ -347,20 +362,42 @@ def score_company(company: dict, lead_config: dict) -> dict:
     medium_min = bands.get("medium_min_score", 45)
 
     if normalised >= high_min:
-        priority = "High"
+        base_tier = "High"
     elif normalised >= medium_min:
-        priority = "Medium"
+        base_tier = "Medium"
     else:
-        priority = "Low"
+        base_tier = "Low"
 
-    # Business-facing priority tiers are intentionally promoted one step:
-    # High stays High, Medium becomes High, and Low becomes Medium.
-    # This changes only the displayed/selected lead tier; the numeric
-    # priority score remains unchanged for transparency.
-    priority = {"High": "High", "Medium": "High", "Low": "Medium"}.get(priority, priority)
+    # A recognised low-probability-buyer type (staffing/recruitment/IT-
+    # services/AI-consulting/outsourcing/BPO - see icp.COMPETITOR_DICTIONARY
+    # and pipeline.IcpFilteringStage, which sets this flag) is always
+    # capped at Low Buyer Probability, regardless of its computed score.
+    # This is what keeps the ICP/scoring logic honest while still
+    # including these companies in the export (requirement: never
+    # classify a poor-quality company as High/Medium just to raise the
+    # count).
+    low_probability_buyer = bool(company.get("is_low_probability_buyer"))
+    buyer_probability = "Low" if low_probability_buyer else base_tier
+
+    if low_probability_buyer:
+        # Exempt from the promotion below for the same reason: promoting
+        # a recognised competitor to "Medium"/"High" would misrepresent
+        # it as a good-fit lead.
+        priority = "Low"
+        company_type = company.get("company_type") or UNKNOWN
+        reasons.insert(0, f"low-probability buyer ({company_type}) - capped at Low (+0)")
+    else:
+        # Business-facing priority tiers are intentionally promoted one
+        # step: High stays High, Medium becomes High, and Low becomes
+        # Medium. This changes only the displayed/selected lead tier; the
+        # numeric priority score and Buyer Probability above remain
+        # unchanged for transparency. Unmodified from before this change.
+        priority = {"High": "High", "Medium": "High", "Low": "Medium"}.get(base_tier, base_tier)
 
     return {
         "priority_score": normalised,
+        "icp_fit_score": icp_fit_score,
+        "buyer_probability": buyer_probability,
         "lead_priority": priority,
         "priority_reason": "; ".join(reasons),
     }

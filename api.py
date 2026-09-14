@@ -134,10 +134,12 @@ def _run_search(run_id: str, job_title: str, region: str) -> None:
             contacts_found=result["contacts_found"],
             contacts_not_found=result["contacts_not_found"],
             priority_counts=result["priority_counts"],
+            buyer_probability_counts=result.get("buyer_probability_counts", {}),
             target_leads=search_summary.get("lead_target", lead_config.get("target_leads", 50)),
             target_reached=search_summary.get("target_reached", False),
             regions_searched=search_summary.get("regions_searched", []),
             regions_skipped=search_summary.get("regions_skipped", []),
+            country_lock_report=result.get("country_lock_report", {}),
         )
     except Exception as exc:
         log.warning(f"[ERROR] run {run_id} failed: {exc}")

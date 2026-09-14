@@ -7,9 +7,14 @@ dedicated remote-only job boards — RemoteOK, Remotive, We Work Remotely and Jo
 postings, filters out anything that isn't genuinely remote, and exports the results to a
 single **Excel (.xlsx)** file.
 
-If your chosen region doesn't have enough remote jobs, the remaining regions are searched
-automatically as a fallback until the target count is met — with your selected region's jobs
-kept first in the file.
+> **Update - STRICT COUNTRY LOCK:** the fallback-to-other-regions behaviour described in this
+> Stage 1 document (and below) has since been replaced. The lead-generation pipeline
+> (`pipeline.py`, `icp.py`, `lead_signals.py`, driven from `main.py`'s `execute_pipeline`) now
+> searches **only** the region/country you select - never any other one, no matter how far short
+> of the configured `MAX_COMPANIES` ceiling (`lead_pipeline.max_companies` in `config.yaml`,
+> default 1000) it falls. See the `REGION_DEFINITIONS` note and `execute_pipeline()` docstring in
+> `main.py` for the current behaviour. The rest of this section (and §2, §10-§12 below) describes
+> the original Stage 1 design and is kept for history.
 
 This is **Stage 1**. It is deliberately simple: one script, one config file, one Excel file out.
 There is no website, no database, no login and no chatbot.

@@ -4,6 +4,11 @@
 # title and the region (USA / UK / Australia / Europe) are chosen
 # interactively each time you run `python main.py` - you don't need to
 # edit this file to run a new search.
+#
+# STRICT COUNTRY LOCK: whichever region/country is selected at the
+# prompt is the only one ever searched for that run. The system never
+# falls back to another country to reach MAX_COMPANIES below - see
+# main.py's REGION_DEFINITIONS note and execute_pipeline().
 # =============================================================================
 
 # Job platforms to search every time.
@@ -31,15 +36,17 @@ platforms: ["indeed", "linkedin", "zip_recruiter", "glassdoor", "remoteok", "rem
 # Only consider postings from the last N hours (168 = 7 days).
 hours_old: 168
 
-# How many results to request per platform before deduplication/capping.
-# Fetching generously here means the target below is more likely to be
-# reached after duplicates are removed.
-results_wanted_per_platform: 50
+# How many results to request per platform, per page, before dedup/capping.
+# Fetching generously here means MAX_COMPANIES (below, in lead_pipeline)
+# is more likely to be reached after duplicates are removed.
+results_wanted_per_platform: 100
 
 # How many pages to page through per platform (via JobSpy's `offset`).
 # Raising this collects more jobs when a platform has them; it does not
-# invent jobs when a platform has run out.
-max_pages_per_platform: 3
+# invent jobs when a platform has run out. Sized up alongside
+# MAX_COMPANIES=1000 so pagination can actually reach that many unique
+# companies before a country's available results are exhausted.
+max_pages_per_platform: 10
 
 # Maximum number of rows in the final Excel file. If fewer genuine
 # remote postings exist after filtering, the output will have fewer
@@ -150,16 +157,18 @@ job_sources:
   remoteok:
     # RemoteOK's feed has no search parameter - it returns its ~100 most
     # recent postings, filtered here by keyword and location. This caps
-    # how many of THOSE matches are kept, not how many are fetched.
-    results_wanted: 40
+    # how many of THOSE matches are kept, not how many are fetched, so
+    # raising it (vs. the old 40) costs nothing extra over the network -
+    # it just stops leaving genuine matches on the table.
+    results_wanted: 150
 
   remotive:
     # Remotive's API has a real `search` parameter, so the keyword is
     # sent server-side rather than filtered after the fact.
-    results_wanted: 40
+    results_wanted: 150
 
   weworkremotely:
-    results_wanted: 40
+    results_wanted: 150
     # RSS has no keyword search, so these category feeds are fetched in
     # full and filtered by keyword locally. Add/remove slugs from
     # https://weworkremotely.com/categories as your searches need.
@@ -171,7 +180,7 @@ job_sources:
       - "remote-devops-sysadmin-jobs"
 
   jobspresso:
-    results_wanted: 40
+    results_wanted: 150
 
 
 # =============================================================================
@@ -189,18 +198,28 @@ lead_pipeline:
   medium_priority_employee_threshold: 500
   low_priority_employee_threshold: 5000
 
-  # ---- Final lead list ------------------------------------------------
-  # The business target is 50 qualified leads. The list is always sorted
-  # High -> Medium -> Low by priority score, with no fabricated rows.
-  target_leads: 50
-  max_final_leads: 50
-  min_final_leads: 50
+  # ---- Final company list ----------------------------------------------
+  # MAX_COMPANIES: the single configurable ceiling on how many unique
+  # companies are collected and exported. This is a MAXIMUM, not a fixed
+  # target - fewer are exported when fewer valid, country-locked
+  # companies exist, and the run is NEVER padded and NEVER switches the
+  # user's selected country to make up the difference. The list is
+  # always sorted High -> Medium -> Low by priority score.
+  #
+  # (target_leads/max_final_leads/min_final_leads are legacy setting
+  # names kept only for older config files; if present without
+  # max_companies they are read as an alias for it. Set max_companies
+  # here - it is the one setting this system actually needs.)
+  max_companies: 1000
 
-  # ---- Exclusions -----------------------------------------------------
+  # ---- Buyer Probability / Low Probability Buyer Dictionary -----------
   # Company types whose primary business competes with an AI
-  # engineering/services offering. Delete an entry to stop excluding it.
-  # Large organisations are deliberately NOT here: they stay in the
-  # dataset and simply score lower.
+  # engineering/services offering. These companies are NOT discarded -
+  # every one of them is still scored, kept, and exported to Excel with
+  # Buyer Probability = Low (see pipeline.IcpFilteringStage and
+  # lead_signals.score_company). Delete an entry below to stop flagging
+  # that type as low-probability. Large organisations are deliberately
+  # NOT here: they stay in the dataset and simply score lower.
   excluded_company_types:
     - staffing_agency
     - recruitment_agency
@@ -221,8 +240,12 @@ lead_pipeline:
     enable_careers_page_lookup: true
     respect_robots_txt: true
     request_timeout_seconds: 8
-    # Enrichment makes network calls, so it is budgeted per run.
-    max_companies_to_enrich: 100
+    # Enrichment makes network calls, so it is budgeted per run. Raised
+    # alongside MAX_COMPANIES so a large run doesn't report "Contact: Not
+    # Found" for hundreds of companies purely because of this budget;
+    # raise further if you regularly export close to MAX_COMPANIES and
+    # can tolerate the extra network time.
+    max_companies_to_enrich: 300
     # LinkedIn *search* links for recruiter titles. These are research
     # links, never claimed profiles - profiles cannot be read without
     # scraping behind a login, which this project does not do.

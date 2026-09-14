@@ -76,6 +76,17 @@ OUTPUT_COLUMNS = {
 # European countries that are searched in turn. The others are single
 # countries. Country spellings must match JobSpy's supported list:
 # https://github.com/speedyapply/JobSpy
+#
+# STRICT COUNTRY LOCK: whichever region the user selects here is the
+# ONLY one ever searched, for the entire run - see collect_jobs and
+# execute_pipeline below, which search `[selected]` alone with no
+# fallback to any other entry in REGION_ORDER. If the selected region
+# yields fewer companies than MAX_COMPANIES, the run exports what it
+# found rather than switching countries to make up the difference.
+# Europe's five countries are the one exception, and it is not really an
+# exception: they are the existing, single "Europe" selection - searching
+# all five is what selecting "Europe" has always meant, not a fallback to
+# a different region.
 REGION_DEFINITIONS = {
     "USA": [
         {"country_indeed": "USA", "location": "United States"},
@@ -130,8 +141,11 @@ def load_config(path: str) -> dict:
         ["indeed", "linkedin", "remoteok", "remotive", "weworkremotely", "jobspresso"],
     )
     config.setdefault("hours_old", 168)
-    config.setdefault("results_wanted_per_platform", 50)
-    config.setdefault("max_pages_per_platform", 3)
+    # Raised so a MAX_COMPANIES=1000 run has enough raw postings to work
+    # with (see main.md/config.yaml comments on MAX_COMPANIES); still a
+    # per-call/per-page cap, not the overall company ceiling.
+    config.setdefault("results_wanted_per_platform", 100)
+    config.setdefault("max_pages_per_platform", 10)
     config.setdefault("target_total_jobs", 50)
     config.setdefault("lead_search", {"job_buffer_per_location": 250})
     config.setdefault("output_dir", "./output")
@@ -251,12 +265,15 @@ JOBSPY_PLATFORMS = {"indeed", "linkedin", "zip_recruiter", "glassdoor", "bayt", 
 
 def fetch_platform(platform: str, job_title: str, location: str, country_indeed: str,
                    hours_old: int, results_wanted: int,
-                   max_pages: int, source_config: dict = None) -> tuple[pd.DataFrame, bool]:
+                   max_pages: int, source_config: dict = None) -> tuple[pd.DataFrame, bool, dict]:
     """Fetch one platform. Never raises - a failing platform logs a
     warning and yields whatever it collected so far (or nothing), so one
     bad platform cannot kill the run.
 
-    Returns (df, hours_old_applied_server_side).
+    Returns (df, hours_old_applied_server_side, fetch_stats). fetch_stats
+    is {"pages": N, "requests": N} - how many pages/requests this call
+    actually made, used to build the "Total pages searched" / "Total
+    API/search requests" figures in the final run summary.
 
     Dispatches to one of two implementations depending on the platform:
       - JOBSPY_PLATFORMS (Indeed, LinkedIn, ...) go through JobSpy, with
@@ -281,14 +298,17 @@ def fetch_platform(platform: str, job_title: str, location: str, country_indeed:
             )
         except job_sources.JobSourceError as exc:
             log.warning(f"    [WARN] {platform}: {exc}")
-            return pd.DataFrame(), False
+            return pd.DataFrame(), False, {"pages": 0, "requests": 1}
         except Exception as exc:
             log.warning(f"    [WARN] {platform}: unexpected failure: {exc}")
-            return pd.DataFrame(), False
+            return pd.DataFrame(), False, {"pages": 0, "requests": 1}
         # These boards return absolute dates already, so the shared
         # apply_recency_filter (not a server-side parameter) is what
-        # enforces hours_old for them too - same as Indeed.
-        return df, False
+        # enforces hours_old for them too - same as Indeed. They are not
+        # paginated the way JobSpy platforms are below (their feeds/APIs
+        # are fetched and cached whole for the run - see job_sources.py),
+        # so this counts as one page/one request.
+        return df, False, {"pages": 1, "requests": 1}
 
     kwargs, hours_applied = build_search_kwargs(
         platform, job_title, location, country_indeed, hours_old
@@ -297,6 +317,7 @@ def fetch_platform(platform: str, job_title: str, location: str, country_indeed:
     frames = []
     seen_urls = set()
     collected = 0
+    pages_requested = 0
 
     for page in range(max_pages):
         remaining = results_wanted - collected
@@ -309,6 +330,7 @@ def fetch_platform(platform: str, job_title: str, location: str, country_indeed:
         except Exception as exc:
             log.warning(f"    [WARN] {platform}: fetch failed at offset {offset}: {exc}")
             break
+        pages_requested += 1
 
         if df is None or df.empty:
             log.info(f"    {platform}: page {page + 1} returned 0 rows - stopping pagination.")
@@ -339,7 +361,7 @@ def fetch_platform(platform: str, job_title: str, location: str, country_indeed:
             break
 
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    return combined, hours_applied
+    return combined, hours_applied, {"pages": pages_requested, "requests": pages_requested}
 
 
 def apply_recency_filter(df: pd.DataFrame, hours_old: int) -> tuple[pd.DataFrame, int]:
@@ -359,14 +381,45 @@ def apply_recency_filter(df: pd.DataFrame, hours_old: int) -> tuple[pd.DataFrame
     return df[keep], int((~keep).sum())
 
 
+def apply_country_lock_filter(df: pd.DataFrame, country_indeed: str) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Country Validation (requirement: STRICT COUNTRY LOCK).
+
+    Every row was fetched under a search already restricted to
+    `country_indeed`, but a job board's own filtering is not perfect,
+    so this re-checks each row's own location text before it is allowed
+    any further into the pipeline.
+
+    Reuses job_sources.location_permits - the exact same synonym table
+    and "unknown is not evidence" rule already applied to the dedicated
+    remote-board connectors (RemoteOK/Remotive/WWR) - rather than a
+    second, divergent implementation. A row is dropped only when its
+    location text names a DIFFERENT, specific country than the one it
+    was searched under; a blank or ambiguous location is kept, exactly
+    as it already is everywhere else in this project.
+    """
+    if df.empty:
+        return df, df.iloc[0:0].copy(), 0
+
+    location_col = (
+        df["location"] if "location" in df.columns
+        else pd.Series([""] * len(df), index=df.index)
+    )
+    keep_mask = location_col.apply(
+        lambda loc: job_sources.location_permits(loc, country_indeed)
+    )
+    return df[keep_mask], df[~keep_mask], int((~keep_mask).sum())
+
+
 def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
                               config: dict) -> tuple[pd.DataFrame, dict]:
     """Search every configured platform for one keyword in one country.
 
-    This is the original per-country search, unchanged except that the
-    term it searches is now a keyword rather than always the user's own
-    title - so every platform receives the expanded keywords too, and
-    each row records which keyword found it.
+    Unchanged from the original per-country search except that (1) the
+    term searched is now a keyword rather than always the user's own
+    title, so every platform receives the expanded keywords too and each
+    row records which keyword found it, and (2) every row is re-checked
+    against the selected country before being kept - see
+    apply_country_lock_filter (STRICT COUNTRY LOCK / Country Validation).
     """
     location = entry["location"]
     country_indeed = entry["country_indeed"]
@@ -376,7 +429,7 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
     platform_stats = {}
 
     for platform in config["platforms"]:
-        df, hours_applied = fetch_platform(
+        df, hours_applied, fetch_stats = fetch_platform(
             platform, keyword, location, country_indeed, hours_old,
             config["results_wanted_per_platform"], config["max_pages_per_platform"],
             config.get("job_sources"),
@@ -387,14 +440,21 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
         if not hours_applied and not df.empty:
             df, stale_dropped = apply_recency_filter(df, hours_old)
 
+        invalid_country = 0
+        if not df.empty:
+            df, _dropped_country, invalid_country = apply_country_lock_filter(df, country_indeed)
+
         platform_stats[platform] = {
             "raw": raw_count,
             "stale_dropped": stale_dropped,
+            "invalid_country": invalid_country,
             "kept": len(df),
+            "pages": fetch_stats.get("pages", 0),
+            "requests": fetch_stats.get("requests", 0),
         }
         log.info(
             f"      {platform:<9} fetched {raw_count:>3} | stale {stale_dropped:>2} "
-            f"| carried forward {len(df):>3}"
+            f"| country-mismatch {invalid_country:>2} | carried forward {len(df):>3}"
         )
 
         if df.empty:
@@ -444,10 +504,11 @@ def search_country(job_title: str, entry: dict, config: dict,
         }
         for platform, values in stats.items():
             running = platform_stats.setdefault(
-                platform, {"raw": 0, "stale_dropped": 0, "kept": 0}
+                platform, {"raw": 0, "stale_dropped": 0, "invalid_country": 0,
+                          "kept": 0, "pages": 0, "requests": 0}
             )
             for field in running:
-                running[field] += values[field]
+                running[field] += values.get(field, 0)
 
         if not raw.empty:
             frames.append(raw)
@@ -526,13 +587,14 @@ def search_region(region: str, job_title: str, config: dict, needed: int,
 
 
 def collect_jobs(user_input: dict, config: dict) -> tuple[pd.DataFrame, dict]:
-    """Run the selected region first, then fall back through the other
-    regions only if the target has not been met.
+    """Search the user's selected region/country only.
 
-    Ordering matters here and is deliberate: frames are concatenated in
-    the order they were searched and dedup keeps the first occurrence, so
-    the selected region's jobs stay at the top of the spreadsheet and a
-    posting that appears in two regions is credited to the selected one.
+    STRICT COUNTRY LOCK: unlike an earlier version of this function, the
+    search never falls back to another region/country when the selected
+    one falls short of the target. See the REGION_DEFINITIONS module
+    note. Europe's five countries are still searched in the order given
+    there - that is what "Europe" as a selection has always meant, not a
+    fallback to a different region.
     """
     job_title = user_input["job_title"]
     selected = user_input["region"]
@@ -563,24 +625,28 @@ def collect_jobs(user_input: dict, config: dict) -> tuple[pd.DataFrame, dict]:
     else:
         log.info("           No similar keywords found - searching the title alone.")
 
-    fallback_order = [r for r in REGION_ORDER if r != selected]
-    search_order = [selected] + fallback_order
+    # STRICT COUNTRY LOCK: only the selected region is ever searched.
+    search_order = [selected]
+    locked_out = [r for r in REGION_ORDER if r != selected]
+    if locked_out:
+        log.info(
+            f"[COUNTRY LOCK] Locked to '{selected}'. {', '.join(locked_out)} will NOT "
+            f"be searched, even if the {target}-company target is not reached."
+        )
 
     collected = pd.DataFrame()
     dropped_all = []
     region_stats = {}
     filter_totals = {}
     regions_searched = []
-    regions_skipped = []
+    regions_skipped = list(locked_out)
 
     for region in search_order:
         if len(collected) >= target:
-            regions_skipped.append(region)
             continue
 
         needed = target - len(collected)
-        is_fallback = region != selected
-        label = "FALLBACK" if is_fallback else "SELECTED"
+        label = "SELECTED"
         log.info(f"\n[{label}] Region: {region}  (need {needed} more)")
 
         kept, dropped, filter_stats, stats = search_region(
@@ -869,7 +935,8 @@ def _format_worksheet(worksheet) -> None:
     # with very different shapes, so a per-letter table would misfit them.
     wide_headers = {
         "Lead Summary": 70, "Matching Job URLs": 55, "Matching Job Titles": 45,
-        "Priority Reason": 55, "LinkedIn Search Links": 45, "job_description": 70,
+        "Priority Reason": 55, "Reason": 55, "LinkedIn Search Links": 45,
+        "job_description": 70,
         "Hiring Signal": 30, "Company Website": 32, "Contact Email": 30,
         "Contact LinkedIn URL": 34, "Contact Source": 30, "Exclusion Reason": 34,
         "Company Name": 30, "Value": 60, "Metric": 45, "job_url": 34,
@@ -878,13 +945,15 @@ def _format_worksheet(worksheet) -> None:
         "matched_keyword": 30, "original_job_title": 26,
         "Contact Email (2nd)": 28, "Funding Signal": 30, "Team Maturity": 24,
         "AI Hiring Stage": 22, "job_title": 34, "company_name": 26,
+        "Industry": 26, "Location": 30,
     }
     narrow_headers = {
         "Lead Priority": 13, "Priority Score": 12, "Employee Count": 15,
         "Hiring Signal Strength": 15, "Contact Strength": 13,
         "Company Size": 15, "Matching Position Count": 12, "Country": 12,
         "Region": 12, "Date Fetched": 13, "Contact Confidence": 13,
-        "is_remote": 10,
+        "is_remote": 10, "Buyer Probability": 15, "ICP Fit Score": 13,
+        "Source": 20,
     }
     for col_idx in range(1, worksheet.max_column + 1):
         letter = get_column_letter(col_idx)
@@ -895,15 +964,28 @@ def _format_worksheet(worksheet) -> None:
     # Make High-priority leads findable at a glance, as the brief asks.
     headers = [str(worksheet.cell(row=1, column=i).value or "")
                for i in range(1, worksheet.max_column + 1)]
+    fills = {
+        "High": PatternFill("solid", fgColor="C6EFCE"),
+        "Medium": PatternFill("solid", fgColor="FFEB9C"),
+        "Low": PatternFill("solid", fgColor="F2F2F2"),
+    }
     if "Lead Priority" in headers:
         priority_col = headers.index("Lead Priority") + 1
-        fills = {
-            "High": PatternFill("solid", fgColor="C6EFCE"),
-            "Medium": PatternFill("solid", fgColor="FFEB9C"),
-            "Low": PatternFill("solid", fgColor="F2F2F2"),
-        }
         for row_idx in range(2, worksheet.max_row + 1):
             cell = worksheet.cell(row=row_idx, column=priority_col)
+            fill = fills.get(str(cell.value))
+            if fill:
+                cell.fill = fill
+                cell.font = Font(bold=str(cell.value) == "High")
+
+    # Same colour coding for the new Buyer Probability column, so High/
+    # Medium/Low probability companies (including Low-Probability Buyer
+    # Dictionary matches, which are never discarded from this sheet) are
+    # just as easy to scan at a glance.
+    if "Buyer Probability" in headers:
+        buyer_col = headers.index("Buyer Probability") + 1
+        for row_idx in range(2, worksheet.max_row + 1):
+            cell = worksheet.cell(row=row_idx, column=buyer_col)
             fill = fills.get(str(cell.value))
             if fill:
                 cell.fill = fill
@@ -1077,14 +1159,26 @@ def print_summary(summary: dict, final_count: int, target_leads: int,
 # for the job-level sheet.
 LEAD_COLUMNS = {
     "Lead Priority": "lead_priority",
+    # Buyer Probability (High/Medium/Low): the plain, un-promoted
+    # classification tier. Low-probability-buyer companies (staffing/
+    # recruitment/IT-services/AI-consulting/outsourcing/BPO - see the
+    # Low Probability Buyer Dictionary in pipeline.IcpFilteringStage and
+    # icp.COMPETITOR_DICTIONARY) are capped here at "Low" and are always
+    # included in this sheet, never discarded - see lead_signals.score_company.
+    "Buyer Probability": "buyer_probability",
     "Priority Score": "priority_score",
+    "ICP Fit Score": "icp_fit_score",
     "Company Name": "company_name",
     "Company Website": "company_url_direct",
     "Company Domain": "company_domain",
+    "Industry": "company_industry",
+    "Location": "locations",
     "Employee Count": "employee_count",
     "Company Size": "company_size",
     "Company Type": "company_type",
     "ICP Status": "icp_status",
+    "Reason": "priority_reason",
+    "Source": "source_platforms",
     "Lead Summary": "lead_summary",
     "Matching Position Count": "matching_position_count",
     "Matching Job Titles": "matching_job_titles",
@@ -1103,6 +1197,7 @@ LEAD_COLUMNS = {
     "Contact Email": "contact_email",
     "Contact Email (2nd)": "contact_email_secondary",
     "Contact Source": "contact_source",
+    # Preserved exactly as before - not removed, not renamed.
     "LinkedIn Search Links": "contact_search_urls",
     "Country": "country",
     "Region": "region",
@@ -1111,6 +1206,11 @@ LEAD_COLUMNS = {
 
 # Blank cells read as missing data; these say so explicitly instead.
 NOT_AVAILABLE_DEFAULTS = {
+    "Buyer Probability": "Unknown",
+    "Industry": "Unknown",
+    "Location": "Unknown",
+    "Reason": "Not Available",
+    "Source": "Unknown",
     "Employee Count": "Unknown",
     "Company Size": "Unknown",
     "Company Type": "Unknown",
@@ -1158,31 +1258,40 @@ def build_pipeline_summary_sheet(ctx, jobs_count: int, leads_count: int) -> pd.D
     dynamic = ctx.artifacts.get("dynamic_lead_search", {})
     search_summary = ctx.artifacts.get("search_summary", {})
     priority_counts = selection.get("priority_counts", {})
-    target = dynamic.get("target_leads", search_summary.get("lead_target", 50))
+    buyer_counts = selection.get("buyer_probability_counts", {})
+    target = dynamic.get("target_leads", search_summary.get("lead_target",
+             pipeline.LEAD_CONFIG_DEFAULTS["max_companies"]))
 
     rows = [
-        ("Target qualified leads", target),
+        ("Selected country/region (locked)", search_summary.get("selected_region", "")),
+        ("Target companies (MAX_COMPANIES)", target),
         ("Target reached", "Yes" if leads_count >= target else "No"),
         ("Total job rows in audit", jobs_count),
         ("Total unique companies", dedup_stats.get("companies", 0)),
-        ("Companies excluded (competitors)", icp_stats.get("excluded", 0)),
+        ("Low-probability buyer companies (flagged, kept & exported)", icp_stats.get("excluded", 0)),
         ("Total qualified companies", icp_stats.get("qualified", 0)),
         ("Companies with no reported employee count", icp_stats.get("unknown_size", 0)),
         ("Contacts found", contact_stats.get("contacts_found", 0)),
         ("Contacts not found", contact_stats.get("contacts_not_found", 0)),
-        ("Total final leads", leads_count),
-        ("High priority", priority_counts.get("High", 0)),
-        ("Medium priority", priority_counts.get("Medium", 0)),
-        ("Low priority", priority_counts.get("Low", 0)),
+        ("Total final companies exported", leads_count),
+        ("Lead Priority - High", priority_counts.get("High", 0)),
+        ("Lead Priority - Medium", priority_counts.get("Medium", 0)),
+        ("Lead Priority - Low", priority_counts.get("Low", 0)),
+        ("Buyer Probability - High", buyer_counts.get("High", 0)),
+        ("Buyer Probability - Medium", buyer_counts.get("Medium", 0)),
+        ("Buyer Probability - Low", buyer_counts.get("Low", 0)),
         ("Locations searched", ", ".join(search_summary.get("regions_searched", []))),
-        ("Locations skipped", ", ".join(search_summary.get("regions_skipped", []))),
+        ("Locations locked out (country lock - never searched)",
+         ", ".join(search_summary.get("regions_skipped", []))),
     ]
 
     if leads_count < target:
+        selected_region = search_summary.get("selected_region", "the selected country")
         rows.append((
             "NOTE",
-            f"Only {leads_count} genuine qualified leads were available after "
-            f"all configured locations were searched. The workbook was not padded.",
+            f"Only {leads_count} genuine companies were available in {selected_region} "
+            f"after all its available results were searched. The workbook was not "
+            f"padded, and the country was never switched to make up the difference.",
         ))
 
     for region, stats in search_summary.get("region_stats", {}).items():
@@ -1226,6 +1335,42 @@ def print_pipeline_report(ctx, jobs_count: int, leads_count: int) -> None:
     print("=" * 70)
 
 
+def print_country_lock_summary(report: dict) -> None:
+    """Final country-lock / MAX_COMPANIES summary (requirements 4 & 11):
+    selected country, what was fetched/paginated/filtered, the Buyer
+    Probability breakdown, and whether the configured ceiling was
+    reached or the selected country's results were simply exhausted.
+    """
+    if not report:
+        return
+    print("\n" + "=" * 70)
+    print("COUNTRY LOCK / MAX_COMPANIES SUMMARY")
+    print("=" * 70)
+    print(f"Selected Country                 : {report['selected_country']}")
+    print(f"Target (MAX_COMPANIES)           : {report['max_companies']}")
+    print(f"Companies Fetched (raw, pre-dedup): {report['companies_fetched_raw']}")
+    print(f"Total Pages Searched              : {report['pages_searched']}")
+    print(f"Total API/Search Requests         : {report['requests_made']}")
+    print(f"Stale (older than cut-off) Removed: {report['stale_removed']}")
+    print(f"Invalid Country Removed           : {report['invalid_country_removed']}")
+    print(f"Duplicate Postings Merged         : {report['duplicate_postings_merged']}")
+    print(f"Low-Probability Buyers (flagged, kept): {report['low_probability_buyers']}")
+    print(f"High Probability                  : {report['high_probability']}")
+    print(f"Medium Probability                : {report['medium_probability']}")
+    print(f"Low Probability                   : {report['low_probability']}")
+    print(f"Final Companies Exported          : {report['final_companies_exported']}")
+    if report["regions_locked_out"]:
+        print(f"Regions locked out (never searched): {', '.join(report['regions_locked_out'])}")
+    status = (
+        f"MAX_COMPANIES limit ({report['max_companies']}) reached"
+        if report["target_reached"]
+        else f"All available valid {report['selected_country']} results exhausted "
+             "(country was never switched to make up the difference)"
+    )
+    print(f"Status                             : {status}")
+    print("=" * 70)
+
+
 def _merge_region_search_summary(summary: dict, region: str, kept: pd.DataFrame,
                                  dropped: pd.DataFrame, filter_stats: dict, stats: dict,
                                  role: str) -> None:
@@ -1242,15 +1387,37 @@ def _merge_region_search_summary(summary: dict, region: str, kept: pd.DataFrame,
         summary.setdefault("dropped_frames", []).append(dropped)
 
 
+def _sum_search_stats(region_stats: dict) -> dict:
+    """Roll the per-platform fetch/pagination/country-validation counters
+    (set in search_keyword_in_country, aggregated in search_country) all
+    the way up for the final country-lock/MAX_COMPANIES summary."""
+    totals = {"raw": 0, "stale_dropped": 0, "invalid_country": 0,
+             "kept": 0, "pages": 0, "requests": 0}
+    for region_data in (region_stats or {}).values():
+        for country_data in (region_data.get("countries") or {}).values():
+            for platform_data in (country_data.get("platforms") or {}).values():
+                for key in totals:
+                    totals[key] += platform_data.get(key, 0)
+    return totals
+
+
 def _dynamic_lead_target(config: dict, lead_config: dict) -> int:
-    """Return the actual business target for one run."""
-    target = lead_config.get("target_leads", 50)
+    """Return MAX_COMPANIES - the actual business ceiling for one run.
+
+    lead_config["target_leads"] is already derived from
+    lead_config["max_companies"] by pipeline.load_lead_config; this
+    defensive fallback exists only for a lead_config built some other
+    way, and pulls its default from the single place max_companies is
+    defined (pipeline.LEAD_CONFIG_DEFAULTS) rather than a second literal.
+    """
+    fallback = pipeline.LEAD_CONFIG_DEFAULTS["max_companies"]
+    target = lead_config.get("target_leads", fallback)
     try:
         target = int(target)
     except (TypeError, ValueError):
-        target = int(lead_config.get("target_leads", 50))
+        target = fallback
     if target <= 0:
-        target = int(lead_config.get("target_leads", 50))
+        target = fallback
     return target
 
 
@@ -1261,7 +1428,9 @@ def _job_buffer_for_location(config: dict, target_leads: int) -> int:
     is not one lead: company deduplication, ICP filtering and scoring can
     reduce the count substantially. The buffer only limits the amount of
     work done in one location pass; the final stop condition is always the
-    number of qualified leads returned by the lead pipeline.
+    number of qualified companies returned by the lead pipeline. It scales
+    with MAX_COMPANIES (target_leads * 4) so a 1000-company target still
+    collects a realistic pool to filter/dedupe/score down from.
     """
     block = config.get("lead_search") or {}
     try:
@@ -1298,13 +1467,15 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
 
     Core rule:
 
-        STOP when UNIQUE QUALIFIED LEADS >= target_leads.
+        STOP when UNIQUE QUALIFIED LEADS >= target_leads (MAX_COMPANIES).
 
-    The selected region is always searched first. When it does not produce
-    enough leads, the remaining regions are searched in the configured
-    fallback order. The pipeline is re-evaluated after each region so the
-    decision to continue is based on actual lead quality, company
-    deduplication, ICP filtering, contact enrichment and prioritisation.
+    STRICT COUNTRY LOCK: only the user's selected region/country is ever
+    searched - there is no fallback to another region, no matter how far
+    short of MAX_COMPANIES it falls. See the REGION_DEFINITIONS module
+    note. The pipeline is re-evaluated as postings accumulate so the
+    decision to stop is based on actual lead quality, company
+    deduplication, ICP filtering, contact enrichment and prioritisation -
+    not just a raw posting count.
     """
     target_leads = _dynamic_lead_target(config, lead_config)
     job_buffer = _job_buffer_for_location(config, target_leads)
@@ -1320,7 +1491,10 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     ).expand(job_title)
     keyword_list = expansion["keywords"] or [job_title]
 
-    search_order = [selected] + [r for r in REGION_ORDER if r != selected]
+    # STRICT COUNTRY LOCK: only the selected region is ever searched, no
+    # matter how short of MAX_COMPANIES it falls.
+    search_order = [selected]
+    locked_out_regions = [r for r in REGION_ORDER if r != selected]
     collected = pd.DataFrame()
 
     summary = {
@@ -1328,7 +1502,7 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
         "keyword_expansion": expansion,
         "keyword_counts_collected": {k: 0 for k in keyword_list},
         "regions_searched": [],
-        "regions_skipped": [],
+        "regions_skipped": list(locked_out_regions),
         "region_stats": {},
         "filter_totals": {},
         "dropped_frames": [],
@@ -1336,8 +1510,13 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
         "job_buffer_per_location": job_buffer,
     }
 
-    log.info(f"\n[LEAD TARGET] Target: {target_leads} qualified leads")
-    log.info(f"[LOCATION ORDER] { ' -> '.join(search_order) }")
+    log.info(f"\n[LEAD TARGET] Target (MAX_COMPANIES): {target_leads} qualified companies")
+    log.info(f"[COUNTRY LOCK] Selected country/region: {selected}")
+    if locked_out_regions:
+        log.info(
+            f"[COUNTRY LOCK] {', '.join(locked_out_regions)} will NOT be searched, "
+            f"even if fewer than {target_leads} companies are found in {selected}."
+        )
     log.info(f"[KEYWORDS] Searched title: '{job_title}'")
     if expansion["expanded"]:
         log.info(
@@ -1351,7 +1530,9 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     previous_lead_count = 0
 
     for region in search_order:
-        label = "SELECTED" if region == selected else "FALLBACK"
+        # search_order is always just [selected] under the strict country
+        # lock, so this is always the selected region - never a fallback.
+        label = "SELECTED"
         if previous_lead_count >= target_leads:
             summary["regions_skipped"].append(region)
             continue
@@ -1517,6 +1698,34 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     icp_stats = ctx.artifacts.get("icp_stats", {})
     contact_stats = ctx.artifacts.get("contact_stats", {})
     selection = ctx.artifacts.get("selection_stats", {})
+    buyer_counts = selection.get("buyer_probability_counts", {})
+
+    # Country-lock / MAX_COMPANIES summary (requirements 4 and 11): one
+    # consolidated report of what was fetched, filtered, and exported for
+    # the selected country, built from the same artifacts as everything
+    # else above rather than a separate tracking mechanism.
+    search_totals = _sum_search_stats(summary.get("region_stats", {}))
+    final_count = len(leads_sheet)
+    country_lock_report = {
+        "selected_country": selected,
+        "max_companies": target_leads,
+        "companies_fetched_raw": search_totals["raw"],
+        "pages_searched": search_totals["pages"],
+        "requests_made": search_totals["requests"],
+        "stale_removed": search_totals["stale_dropped"],
+        "invalid_country_removed": search_totals["invalid_country"],
+        "duplicate_postings_merged": max(
+            dedup_stats.get("job_rows", 0) - dedup_stats.get("companies", 0), 0
+        ),
+        "low_probability_buyers": icp_stats.get("low_probability_buyers", icp_stats.get("excluded", 0)),
+        "high_probability": buyer_counts.get("High", 0),
+        "medium_probability": buyer_counts.get("Medium", 0),
+        "low_probability": buyer_counts.get("Low", 0),
+        "final_companies_exported": final_count,
+        "target_reached": final_count >= target_leads,
+        "regions_locked_out": [r for r in REGION_ORDER if r != selected],
+    }
+    summary["country_lock_report"] = country_lock_report
 
     if progress_callback:
         try:
@@ -1546,6 +1755,8 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
         "contacts_found": contact_stats.get("contacts_found", 0),
         "contacts_not_found": contact_stats.get("contacts_not_found", 0),
         "priority_counts": selection.get("priority_counts", {}),
+        "buyer_probability_counts": buyer_counts,
+        "country_lock_report": country_lock_report,
     }
 
 
@@ -1569,10 +1780,11 @@ def main():
 
         pipeline.print_pipeline_summary(ctx)
         print_pipeline_report(ctx, result["jobs_count"], result["leads_count"])
+        print_country_lock_summary(result.get("country_lock_report"))
 
         print(f"\nOutput written to  : {result['output_path']}")
         if result["excluded_path"]:
-            print(f"Excluded companies : {result['excluded_path']}")
+            print(f"Low-probability buyer companies (audit log): {result['excluded_path']}")
 
     except KeyboardInterrupt:
         print("\nCancelled.")

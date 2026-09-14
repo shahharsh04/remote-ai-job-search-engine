@@ -51,13 +51,26 @@ LEAD_CONFIG_DEFAULTS = {
     "medium_priority_employee_threshold": 500,
     "low_priority_employee_threshold": 5000,
 
-    # Target size of the final qualified-lead list. The search can
-    # expand to additional locations until this number is reached.
-    "target_leads": 50,
-    "max_final_leads": 50,
-    "min_final_leads": 50,
+    # MAX_COMPANIES - the single configurable ceiling on how many unique
+    # companies are collected and exported (requirement: "Configurable
+    # Company Limit"). This is a MAXIMUM, not a fixed target: the run
+    # exports fewer when fewer valid, country-locked companies exist -
+    # never padded, and the selected country is never changed to make up
+    # the difference (see main.py's strict country lock).
+    #
+    # target_leads/max_final_leads/min_final_leads below are internal
+    # aliases kept only because the rest of the codebase (main.py, api.py)
+    # already reads lead_config["target_leads"]; load_lead_config always
+    # overwrites all three from max_companies, so 1000 is defined in
+    # exactly one place rather than hardcoded in several.
+    "max_companies": 1000,
+    "target_leads": 1000,
+    "max_final_leads": 1000,
+    "min_final_leads": 1000,
 
-    # Keep companies removed by ICP filtering in their own file.
+    # Keep low-probability-buyer companies (flagged by ICP filtering, not
+    # discarded) recorded in their own persistent file - the Low
+    # Probability Buyer Dictionary. See IcpFilteringStage below.
     "save_excluded_companies": True,
     "excluded_company_dictionary_path": "data/excluded_companies.json",
 
@@ -159,7 +172,7 @@ def load_lead_config(config: dict) -> dict:
     for key in (
         "preferred_min_employees", "preferred_max_employees",
         "medium_priority_employee_threshold", "low_priority_employee_threshold",
-        "target_leads", "max_final_leads", "min_final_leads",
+        "max_companies", "target_leads", "max_final_leads", "min_final_leads",
     ):
         value = lead_config[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -200,14 +213,22 @@ def load_lead_config(config: dict) -> dict:
         lead_config["low_priority_employee_threshold"] = \
             LEAD_CONFIG_DEFAULTS["low_priority_employee_threshold"]
 
-    # `target_leads` is the business target. Keep the legacy max/min
-    # settings synchronized so older callers remain compatible.
-    if lead_config["target_leads"] <= 0:
-        problems.append("target_leads must be greater than zero")
-        lead_config["target_leads"] = LEAD_CONFIG_DEFAULTS["target_leads"]
+    # MAX_COMPANIES is the one setting a non-engineer should ever need to
+    # change. A config written before this setting existed may still set
+    # `target_leads` directly - honour that as the value instead of
+    # silently reverting to the 1000 default.
+    if "max_companies" not in raw and "target_leads" in raw:
+        lead_config["max_companies"] = lead_config["target_leads"]
 
-    lead_config["max_final_leads"] = lead_config["target_leads"]
-    lead_config["min_final_leads"] = lead_config["target_leads"]
+    if lead_config["max_companies"] <= 0:
+        problems.append("max_companies must be greater than zero")
+        lead_config["max_companies"] = LEAD_CONFIG_DEFAULTS["max_companies"]
+
+    # target_leads/max_final_leads/min_final_leads are internal aliases,
+    # always derived from max_companies so the ceiling is defined once.
+    lead_config["target_leads"] = lead_config["max_companies"]
+    lead_config["max_final_leads"] = lead_config["max_companies"]
+    lead_config["min_final_leads"] = lead_config["max_companies"]
 
     bands = lead_config["scoring"]["priority_bands"]
     if bands.get("medium_min_score", 0) > bands.get("high_min_score", 0):
@@ -584,16 +605,26 @@ class CompanyDeduplicationStage(Stage):
 
 
 class IcpFilteringStage(Stage):
-    """Classify each company and drop only direct competitors.
+    """Classify each company's business type and size band.
 
-    Large organisations are NOT excluded - they stay in the dataset and
-    are scored down later. Companies whose size or type could not be
-    established are also kept, marked Unknown: absent data is a gap in
-    what the boards returned, not a reason to discard a prospect.
+    Nothing is discarded here. Large organisations were already kept
+    before this change (scored down later instead). Companies matching a
+    recognised low-probability-buyer type - a direct competitor to our AI
+    engineering/services offering, per the persistent Low Probability
+    Buyer Dictionary (excluded_company_store.py) and
+    icp.COMPETITOR_DICTIONARY - used to be dropped entirely; they are now
+    flagged `is_low_probability_buyer` and carried forward like any other
+    company. lead_signals.score_company caps their Buyer Probability and
+    Lead Priority at "Low" instead of excluding them from the export, so
+    the spreadsheet always shows the full picture: High, Medium AND Low
+    probability companies, up to MAX_COMPANIES. Companies whose size or
+    type could not be established are also kept, marked Unknown: absent
+    data is a gap in what the boards returned, not a reason to discard a
+    prospect.
     """
 
     name = "ICP Filtering"
-    description = "Classify company type and size; exclude competitors only"
+    description = "Classify company type/size and flag low-probability buyers (none are discarded)"
 
     def _run(self, ctx: PipelineContext) -> pd.DataFrame:
         if ctx.data.empty:
@@ -628,16 +659,17 @@ class IcpFilteringStage(Stage):
                                   f"company_domain:{str(x.get('company_domain') or '').strip().lower()}",
                                   f"company_name:{str(x.get('company_name') or '').strip().lower()}"
                               })), None)
-                known_category = (match or {}).get("category", "Known excluded company")
+                known_category = (match or {}).get("category", "Known low-probability buyer")
                 known_reason = (match or {}).get("reason", "Previously identified as a low-probability buyer.")
                 verdicts.append({
                     "employee_count": icp.parse_employee_count(row.get("company_num_employees"))[0],
                     "employee_count_estimate": icp.parse_employee_count(row.get("company_num_employees"))[1],
                     "company_size": icp.size_band(icp.parse_employee_count(row.get("company_num_employees"))[1], ctx.lead_config),
                     "company_type": known_category,
-                    "company_type_evidence": "persistent exclusion dictionary",
+                    "company_type_evidence": "persistent low-probability buyer dictionary",
                     "icp_status": "Excluded",
                     "exclusion_reason": known_reason,
+                    "is_low_probability_buyer": True,
                 })
                 persistent_matches.append({
                     "company_name": identity_record["company_name"] or "Unknown company",
@@ -646,31 +678,36 @@ class IcpFilteringStage(Stage):
                     "exclusion_reason": known_reason,
                 })
             else:
-                verdicts.append(icp.evaluate_company(row, ctx.lead_config))
+                verdict = icp.evaluate_company(row, ctx.lead_config)
+                verdict["is_low_probability_buyer"] = verdict["icp_status"] == "Excluded"
+                verdicts.append(verdict)
         for field in ("employee_count", "employee_count_estimate", "company_size",
                       "company_type", "company_type_evidence", "icp_status",
-                      "exclusion_reason"):
+                      "exclusion_reason", "is_low_probability_buyer"):
             df[field] = [v.get(field) for v in verdicts]
 
-        excluded_mask = df["icp_status"] == "Excluded"
-        excluded = df[excluded_mask]
-        kept = df[~excluded_mask]
+        low_probability_mask = df["is_low_probability_buyer"] == True  # noqa: E712
+        low_probability = df[low_probability_mask]
 
-        # Persist every excluded company across runs. This turns the dictionary
-        # into a cumulative memory: Run 2 can immediately reject a company
-        # already identified in Run 1.
-        if not excluded.empty and ctx.lead_config.get("save_excluded_companies", True):
-            for record in excluded.to_dict("records"):
+        # Persist every flagged company across runs - this is the Low
+        # Probability Buyer Dictionary. It is cumulative memory: Run 2
+        # recognises a company already identified in Run 1 immediately,
+        # without re-running the text classification. Unlike before, the
+        # rows are NOT removed from `df` - they stay in the pipeline and
+        # are exported with Buyer Probability = Low (requirement: "Do not
+        # discard Low Probability companies during filtering").
+        if not low_probability.empty and ctx.lead_config.get("save_excluded_companies", True):
+            for record in low_probability.to_dict("records"):
                 excluded_company_store.add(
                     record,
                     str(record.get("company_type") or "Unknown"),
-                    str(record.get("exclusion_reason") or "Excluded by ICP rules."),
+                    str(record.get("exclusion_reason") or "Flagged as a low-probability buyer by ICP rules."),
                     dictionary_path,
                 )
 
-        # The only reusable exclusion list is the persistent JSON dictionary.
-        # It is cumulative across runs: companies found in Run 1 are loaded
-        # before Run 2 and excluded before they can become leads.
+        # The persistent JSON dictionary is cumulative across runs:
+        # companies found in Run 1 are loaded before Run 2 and recognised
+        # immediately there.
         ctx.add_artifact(
             "persistent_excluded_companies",
             excluded_company_store.all_companies(dictionary_path),
@@ -678,11 +715,20 @@ class IcpFilteringStage(Stage):
         if persistent_matches:
             ctx.add_artifact("persistent_dictionary_matches", persistent_matches)
 
-        if not excluded.empty:
-            ctx.append_excluded(excluded, self.name, "excluded by ICP rules")
-            log.info(f"      excluded {len(excluded)} competitor companies")
+        if not low_probability.empty:
+            # Audit-only snapshot (pre-scoring) of which rows matched a
+            # low-probability-buyer pattern and why. The rows themselves
+            # remain in `df` and continue through every later stage.
+            ctx.append_excluded(
+                low_probability, self.name,
+                "flagged as low-probability buyer (kept, not discarded - see Buyer Probability column)",
+            )
+            log.info(
+                f"      flagged {len(low_probability)} low-probability-buyer companies "
+                "- kept in the pipeline, capped at Buyer Probability: Low"
+            )
 
-        unknown_size = int((kept["company_size"] == icp.UNKNOWN).sum())
+        unknown_size = int((df["company_size"] == icp.UNKNOWN).sum())
         if unknown_size:
             log.info(
                 f"      {unknown_size} company(ies) have no reported employee count "
@@ -691,11 +737,15 @@ class IcpFilteringStage(Stage):
 
         ctx.add_artifact("icp_stats", {
             "companies_in": len(df),
-            "excluded": len(excluded),
-            "qualified": len(kept),
+            # "excluded" kept as the key name for backward compatibility
+            # with main.py/api.py; these companies are flagged, not
+            # removed - see "low_probability_buyers" below.
+            "excluded": len(low_probability),
+            "low_probability_buyers": len(low_probability),
+            "qualified": len(df) - len(low_probability),
             "unknown_size": unknown_size,
         })
-        return kept.reset_index(drop=True)
+        return df.reset_index(drop=True)
 
 
 class ContactEnrichmentStage(Stage):
@@ -798,7 +848,8 @@ class LeadPrioritizationStage(Stage):
         df = ctx.data.copy()
         scores = [lead_signals.score_company(row, ctx.lead_config)
                   for row in df.to_dict("records")]
-        for field in ("priority_score", "lead_priority", "priority_reason"):
+        for field in ("priority_score", "icp_fit_score", "buyer_probability",
+                      "lead_priority", "priority_reason"):
             df[field] = [s.get(field) for s in scores]
         df["contact_strength"] = [lead_signals.contact_strength(row)
                                   for row in df.to_dict("records")]
@@ -811,16 +862,19 @@ class LeadPrioritizationStage(Stage):
 
         minimum = ctx.lead_config["min_final_leads"]
         counts = selected["lead_priority"].value_counts().to_dict()
+        buyer_counts = selected["buyer_probability"].value_counts().to_dict()
         log.info(
-            f"      selected {len(selected)} leads "
-            f"(High {counts.get('High', 0)} / Medium {counts.get('Medium', 0)} / "
-            f"Low {counts.get('Low', 0)})"
+            f"      selected {len(selected)} companies "
+            f"(Lead Priority - High {counts.get('High', 0)} / Medium {counts.get('Medium', 0)} / "
+            f"Low {counts.get('Low', 0)}) "
+            f"(Buyer Probability - High {buyer_counts.get('High', 0)} / "
+            f"Medium {buyer_counts.get('Medium', 0)} / Low {buyer_counts.get('Low', 0)})"
         )
         if len(selected) < minimum:
-            log.warning(
-                f"      [NOTE] only {len(selected)} qualified companies were available, "
-                f"below the configured minimum of {minimum}. Reporting what is real "
-                "rather than padding the list."
+            log.info(
+                f"      [NOTE] {len(selected)} companies were available, below the "
+                f"configured MAX_COMPANIES ceiling of {minimum}. Reporting what is "
+                "real rather than padding the list or searching another country."
             )
 
         ctx.add_artifact("selection_stats", {
@@ -830,6 +884,7 @@ class LeadPrioritizationStage(Stage):
             "below_minimum": len(selected) < minimum,
             "minimum": minimum,
             "priority_counts": counts,
+            "buyer_probability_counts": buyer_counts,
         })
         return selected
 

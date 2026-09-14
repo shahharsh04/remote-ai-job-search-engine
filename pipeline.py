@@ -94,6 +94,13 @@ LEAD_CONFIG_DEFAULTS = {
         "request_timeout_seconds": 8,
         # Enrichment makes network calls, so it is budgeted.
         "max_companies_to_enrich": 20,
+        # How many companies' careers-page lookups run at once (bounded
+        # thread pool - see ContactEnrichmentStage). Each request targets
+        # a different company's own domain, so this is a wall-clock
+        # optimization, not a rate-limit bypass against any one site.
+        # Raise for faster runs on a good connection; lower it back
+        # toward 1 to fully serialize requests again if ever needed.
+        "max_concurrent_requests": 10,
         # LinkedIn *search* links, not profiles - see contacts.py.
         "generate_linkedin_search_urls": True,
         "user_agent": "RemoteJobSearchEngine/1.0 (lead research)",
@@ -770,28 +777,66 @@ class ContactEnrichmentStage(Stage):
         df = ctx.data.copy()
         records = df.to_dict("records")
 
-        results = []
+        not_attempted = {
+            "contact_status": contacts.NOT_FOUND_STATUS,
+            "contact_name": "Not Found",
+            "contact_title": "Not Found",
+            "contact_email": "",
+            "contact_email_secondary": "",
+            "contact_linkedin_url": "",
+            "contact_source": "",
+            "contact_confidence": "None",
+            "contact_sources_checked": "Not attempted (enrichment budget reached)",
+        }
+
+        results = [None] * len(records)
         for index, record in enumerate(records):
             if index >= limit:
-                # Beyond the configured budget, report honestly rather
-                # than pretending a lookup happened.
-                results.append({
-                    "contact_status": contacts.NOT_FOUND_STATUS,
-                    "contact_name": "Not Found",
-                    "contact_title": "Not Found",
-                    "contact_email": "",
-                    "contact_email_secondary": "",
-                    "contact_linkedin_url": "",
-                    "contact_source": "",
-                    "contact_confidence": "None",
-                    "contact_search_urls": contacts.linkedin_search_urls(
+                results[index] = dict(
+                    not_attempted,
+                    contact_search_urls=contacts.linkedin_search_urls(
                         str(record.get("company_name") or ""),
                         settings.get("generate_linkedin_search_urls", True),
                     ),
-                    "contact_sources_checked": "Not attempted (enrichment budget reached)",
-                })
-                continue
-            results.append(contacts.enrich_company(record, ctx.lead_config))
+                )
+
+        # Each in-budget company's enrichment is an independent HTTP
+        # round-trip to that company's OWN site (plus its robots.txt,
+        # fetched once - see contacts._fetch_robots_parser). Running them
+        # sequentially was one of the two biggest contributors to a run
+        # taking well over an hour: 300 companies one-at-a-time, each with
+        # its own multi-second timeout on an unresponsive site, could add
+        # tens of minutes on its own. A bounded thread pool - not one
+        # request per company at once, `max_concurrent_requests` at a
+        # time - cuts that wall-clock time roughly by the concurrency
+        # factor without changing what is requested or how many retries/
+        # timeouts each request gets; it is the "sequential requests that
+        # could safely be optimized" fix, not a rate-limit bypass (each
+        # request still targets a different company's own domain).
+        to_enrich = [(i, r) for i, r in enumerate(records) if i < limit]
+        workers = max(1, int(settings.get("max_concurrent_requests", 10)))
+        if to_enrich:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                future_to_index = {
+                    pool.submit(contacts.enrich_company, record, ctx.lead_config): index
+                    for index, record in to_enrich
+                }
+                for future in concurrent.futures.as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as exc:
+                        # A single company's enrichment must never take
+                        # down the run - report it honestly instead.
+                        results[index] = dict(
+                            not_attempted,
+                            contact_search_urls=contacts.linkedin_search_urls(
+                                str(records[index].get("company_name") or ""),
+                                settings.get("generate_linkedin_search_urls", True),
+                            ),
+                            contact_sources_checked=f"Enrichment failed: {exc}",
+                        )
 
         for field in ("contact_name", "contact_title", "contact_email",
                       "contact_email_secondary", "contact_linkedin_url",
@@ -800,7 +845,10 @@ class ContactEnrichmentStage(Stage):
             df[field] = [r.get(field, "") for r in results]
 
         found = int((df["contact_status"] == "Contact: Found").sum())
-        log.info(f"      contacts found for {found}/{len(df)} companies")
+        log.info(
+            f"      contacts found for {found}/{len(df)} companies "
+            f"({min(limit, len(df))} attempted, {workers} concurrent requests)"
+        )
 
         ctx.add_artifact("contact_stats", {
             "companies": len(df),

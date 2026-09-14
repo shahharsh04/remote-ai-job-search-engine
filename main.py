@@ -16,9 +16,11 @@ config.yaml only holds settings that stay the same across searches
 what you type at the prompts.
 """
 
+import concurrent.futures
 import logging
 import re
 import sys
+import time
 import traceback
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -29,6 +31,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from jobspy import scrape_jobs
 
+import company_identity
 import job_sources
 import keywords as keyword_expansion
 import pipeline
@@ -154,6 +157,24 @@ def load_config(path: str) -> dict:
     config.setdefault("lead_search", {"job_buffer_per_location": 250})
     config.setdefault("output_dir", "./output")
     config.setdefault("remote_strictness", "balanced")
+    # OVERALL_SEARCH_TIMEOUT (seconds). The single ceiling on how long one
+    # run may spend actively searching job boards, checked between
+    # queries (see execute_pipeline/search_country). Once passed, the run
+    # stops starting new queries and moves straight to exporting whatever
+    # was already collected - it never leaves the user waiting
+    # indefinitely, and it never silently drops below MAX_COMPANIES by
+    # pretending the search finished normally (the run/export summary
+    # reports the timeout explicitly). 1800s (30 min) balances that
+    # against genuinely broad multi-keyword, multi-platform coverage -
+    # each LinkedIn-touching query alone typically costs 1-3 minutes
+    # purely from JobSpy's own built-in anti-detection pacing, which this
+    # project does not attempt to bypass or shorten.
+    config.setdefault("search_timeout_seconds", 1800)
+    try:
+        config["search_timeout_seconds"] = max(30, int(config["search_timeout_seconds"]))
+    except (TypeError, ValueError):
+        log.warning("[WARN] search_timeout_seconds is not a number - using 1800.")
+        config["search_timeout_seconds"] = 1800
 
     # Similar-title keyword expansion. Normalised here so every caller -
     # CLI, API, or a script importing this module - sees a complete
@@ -419,51 +440,107 @@ def apply_country_lock_filter(df: pd.DataFrame, country_indeed: str) -> tuple[pd
     return df[keep_mask], df[~keep_mask], int((~keep_mask).sum())
 
 
+def _fetch_and_filter_platform(platform: str, keyword: str, location: str,
+                               country_indeed: str, hours_old: int, config: dict) -> tuple:
+    """One platform's fetch + recency filter + country validation.
+
+    Pulled out of search_keyword_in_country so the per-platform work -
+    each platform being an independent network round-trip to a different
+    site/API - can be run concurrently instead of one-after-another (see
+    search_keyword_in_country). Returns (platform, df, stats_dict).
+    """
+    df, hours_applied, fetch_stats = fetch_platform(
+        platform, keyword, location, country_indeed, hours_old,
+        config["results_wanted_per_platform"], config["max_pages_per_platform"],
+        config.get("job_sources"),
+    )
+    raw_count = len(df)
+
+    stale_dropped = 0
+    if not hours_applied and not df.empty:
+        df, stale_dropped = apply_recency_filter(df, hours_old)
+
+    invalid_country = 0
+    if not df.empty:
+        df, _dropped_country, invalid_country = apply_country_lock_filter(df, country_indeed)
+
+    stats = {
+        "raw": raw_count,
+        "stale_dropped": stale_dropped,
+        "invalid_country": invalid_country,
+        "kept": len(df),
+        "pages": fetch_stats.get("pages", 0),
+        "requests": fetch_stats.get("requests", 0),
+    }
+    return platform, df, stats
+
+
+# How many platforms to fetch at once for a single keyword. Each platform
+# is a different site/API (Indeed, LinkedIn, ZipRecruiter, Glassdoor,
+# RemoteOK, Remotive, We Work Remotely, Jobspresso) with its own session,
+# so running them concurrently is a wall-clock optimization - not a
+# rate-limit bypass against any single platform - and was one of two
+# fixes (the other is ContactEnrichmentStage's concurrency) for runs
+# that previously took well over an hour purely from doing independent,
+# unrelated network calls strictly one after another. Capped at 8 since
+# there are at most 8 configured platforms; raising it further would do
+# nothing.
+MAX_CONCURRENT_PLATFORMS = 8
+
+
 def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
                               config: dict) -> tuple[pd.DataFrame, dict]:
     """Search every configured platform for one keyword in one country.
 
-    Unchanged from the original per-country search except that (1) the
-    term searched is now a keyword rather than always the user's own
-    title, so every platform receives the expanded keywords too and each
-    row records which keyword found it, and (2) every row is re-checked
-    against the selected country before being kept - see
-    apply_country_lock_filter (STRICT COUNTRY LOCK / Country Validation).
+    Platforms are fetched concurrently (see MAX_CONCURRENT_PLATFORMS) -
+    the only change from the original sequential version - then logged
+    and assembled in the configured platform order for a deterministic,
+    reproducible summary regardless of which platform happened to finish
+    first. Every row is re-checked against the selected country before
+    being kept - see apply_country_lock_filter (STRICT COUNTRY LOCK /
+    Country Validation).
     """
     location = entry["location"]
     country_indeed = entry["country_indeed"]
     hours_old = config["hours_old"]
+    platforms = config["platforms"]
+
+    fetched = {}
+    workers = max(1, min(MAX_CONCURRENT_PLATFORMS, len(platforms)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_platform = {
+            pool.submit(
+                _fetch_and_filter_platform, platform, keyword, location,
+                country_indeed, hours_old, config,
+            ): platform
+            for platform in platforms
+        }
+        for future in concurrent.futures.as_completed(future_to_platform):
+            platform = future_to_platform[future]
+            try:
+                _, df, stats = future.result()
+            except Exception as exc:
+                # A single platform failing must never take down the run
+                # (matches fetch_platform's own never-raises contract).
+                log.warning(f"    [WARN] {platform}: unexpected failure: {exc}")
+                df, stats = pd.DataFrame(), {
+                    "raw": 0, "stale_dropped": 0, "invalid_country": 0,
+                    "kept": 0, "pages": 0, "requests": 0,
+                }
+            fetched[platform] = (df, stats)
 
     frames = []
     platform_stats = {}
+    collected_at = datetime.now().isoformat(timespec="seconds")
 
-    for platform in config["platforms"]:
-        df, hours_applied, fetch_stats = fetch_platform(
-            platform, keyword, location, country_indeed, hours_old,
-            config["results_wanted_per_platform"], config["max_pages_per_platform"],
-            config.get("job_sources"),
-        )
-        raw_count = len(df)
-
-        stale_dropped = 0
-        if not hours_applied and not df.empty:
-            df, stale_dropped = apply_recency_filter(df, hours_old)
-
-        invalid_country = 0
-        if not df.empty:
-            df, _dropped_country, invalid_country = apply_country_lock_filter(df, country_indeed)
-
-        platform_stats[platform] = {
-            "raw": raw_count,
-            "stale_dropped": stale_dropped,
-            "invalid_country": invalid_country,
-            "kept": len(df),
-            "pages": fetch_stats.get("pages", 0),
-            "requests": fetch_stats.get("requests", 0),
-        }
+    # Logged/assembled in configured order, not completion order, so two
+    # runs of the same search produce the same summary and export.
+    for platform in platforms:
+        df, stats = fetched[platform]
+        platform_stats[platform] = stats
         log.info(
-            f"      {platform:<9} fetched {raw_count:>3} | stale {stale_dropped:>2} "
-            f"| country-mismatch {invalid_country:>2} | carried forward {len(df):>3}"
+            f"      {platform:<9} fetched {stats['raw']:>3} | stale {stats['stale_dropped']:>2} "
+            f"| country-mismatch {stats['invalid_country']:>2} | carried forward {stats['kept']:>3}"
         )
 
         if df.empty:
@@ -477,16 +554,38 @@ def search_keyword_in_country(keyword: str, original_title: str, entry: dict,
         df["country"] = country_indeed
         if "_search_page" not in df.columns:
             df["_search_page"] = 1
-        df["_collected_at"] = datetime.now().isoformat(timespec="seconds")
+        df["_collected_at"] = collected_at
         frames.append(df)
 
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return combined, platform_stats
 
 
+def _format_elapsed(seconds: float) -> str:
+    """Format seconds as MM:SS (e.g. '08:32'), or HH:MM:SS past one hour."""
+    total = int(max(0, seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def _estimate_unique_companies(df: pd.DataFrame) -> int:
+    """Real (not approximate-by-row-count) running unique-company total
+    for progress reporting, using the same identity grouping as the
+    pipeline's own company-dedup stage - so the number shown mid-search
+    is the same kind of number the final export will contain, not a raw
+    job-row count mislabelled as companies."""
+    if df.empty:
+        return 0
+    groups = company_identity.assign_company_groups(df.to_dict("records"))
+    return len(set(groups))
+
+
 def search_country(job_title: str, entry: dict, config: dict,
                    keyword_list: list = None,
-                   needed: int = None) -> tuple[pd.DataFrame, dict, dict]:
+                   needed: int = None, deadline: float = None,
+                   progress_callback=None, progress_context: dict = None
+                   ) -> tuple[pd.DataFrame, dict, dict]:
     """Search one country across every configured keyword and platform.
 
     `keyword_list[0]` is the user's own title and is always searched
@@ -496,15 +595,28 @@ def search_country(job_title: str, entry: dict, config: dict,
 
     Like the country loop in search_region, the keyword loop stops early
     once `needed` valid remote rows exist - an extra keyword is only
-    worth its network cost while the target is still short.
+    worth its network cost while the target is still short. It also stops
+    - anywhere in the middle, before starting the next query - once
+    `deadline` (a time.monotonic() timestamp) has passed: OVERALL_SEARCH_
+    TIMEOUT, so a run can never continue indefinitely regardless of how
+    many keywords/platforms are configured.
     """
     keyword_list = keyword_list or [job_title]
+    progress_context = progress_context or {}
 
     frames = []
     platform_stats = {}
     keyword_stats = {}
 
     for index, keyword in enumerate(keyword_list):
+        if deadline is not None and time.monotonic() >= deadline:
+            log.warning(
+                f"      [TIMEOUT] OVERALL_SEARCH_TIMEOUT reached before query "
+                f"{index + 1}/{len(keyword_list)} ('{keyword}') - stopping here and "
+                "exporting what was already collected, rather than continuing."
+            )
+            break
+
         # Query-level progress (requirement: "Query 1/20: AI Engineer").
         log.info(f"      [QUERY {index + 1}/{len(keyword_list)}] '{keyword}'"
                  + ("" if index == 0 else "  (similar keyword)"))
@@ -526,12 +638,39 @@ def search_country(job_title: str, entry: dict, config: dict,
         if not raw.empty:
             frames.append(raw)
 
+        so_far = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        kept_so_far, _, _ = apply_remote_safety_filter(so_far, config["remote_strictness"])
+        deduped_so_far, _ = deduplicate(kept_so_far)
+
+        if progress_callback:
+            elapsed = time.monotonic() - progress_context.get("start_time", time.monotonic())
+            pages_so_far = sum(v.get("pages", 0) for v in platform_stats.values())
+            unique_companies = _estimate_unique_companies(deduped_so_far)
+            log.info(
+                f"        Elapsed: {_format_elapsed(elapsed)}  |  Raw jobs collected: "
+                f"{len(deduped_so_far)}  |  Unique companies: {unique_companies}  |  "
+                f"Target: {progress_context.get('target_leads', '?')}"
+            )
+            try:
+                progress_callback({
+                    "stage": "Searching job boards",
+                    "current_region": progress_context.get("region", entry.get("country_indeed", "")),
+                    "query_index": index + 1,
+                    "query_total": len(keyword_list),
+                    "query": keyword,
+                    "pages_searched": pages_so_far,
+                    "raw_jobs_collected": len(deduped_so_far),
+                    "unique_companies_estimate": unique_companies,
+                    "target_leads": progress_context.get("target_leads"),
+                    "elapsed_seconds": elapsed,
+                    "elapsed_formatted": _format_elapsed(elapsed),
+                })
+            except Exception:
+                pass
+
         if needed is None or not frames:
             continue
 
-        so_far = pd.concat(frames, ignore_index=True)
-        kept_so_far, _, _ = apply_remote_safety_filter(so_far, config["remote_strictness"])
-        deduped_so_far, _ = deduplicate(kept_so_far)
         if len(deduped_so_far) >= needed and index + 1 < len(keyword_list):
             log.info(
                 f"      Target reached in {entry['country_indeed']} - skipping "
@@ -544,13 +683,17 @@ def search_country(job_title: str, entry: dict, config: dict,
 
 
 def search_region(region: str, job_title: str, config: dict, needed: int,
-                  keyword_list: list = None) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
+                  keyword_list: list = None, deadline: float = None,
+                  progress_callback=None, progress_context: dict = None
+                  ) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
     """Search one region - which may be several countries, as Europe is -
     and return its valid remote rows.
 
     Stops early between countries once `needed` valid rows have been
     collected, so a region that fills the target on its first country
-    does not pay for the rest.
+    does not pay for the rest. Also stops - before starting the next
+    country - once `deadline` (time.monotonic()) has passed; see
+    search_country's docstring for OVERALL_SEARCH_TIMEOUT.
 
     Returns (kept_df, dropped_df, filter_stats, region_stats).
     """
@@ -560,10 +703,17 @@ def search_region(region: str, job_title: str, config: dict, needed: int,
 
     for entry in entries:
         country = entry["country_indeed"]
+        if deadline is not None and time.monotonic() >= deadline:
+            log.warning(
+                f"    [TIMEOUT] OVERALL_SEARCH_TIMEOUT reached before {country} - "
+                "stopping here and exporting what was already collected."
+            )
+            break
         log.info(f"    -- {country} --")
 
         raw, platform_stats, keyword_stats = search_country(
-            job_title, entry, config, keyword_list, needed
+            job_title, entry, config, keyword_list, needed, deadline,
+            progress_callback, progress_context,
         )
         raw_frames.append(raw)
         per_country[country] = {
@@ -1435,6 +1585,7 @@ def print_country_lock_summary(report: dict) -> None:
     print("=" * 70)
     print(f"Selected Country                 : {report['selected_country']}")
     print(f"Target (MAX_COMPANIES)           : {report['max_companies']}")
+    print(f"Elapsed                           : {report['elapsed_formatted']}")
     print(f"Total Raw Jobs Collected          : {report['raw_jobs_total']}")
     print(f"Total Raw Unique Companies        : {report['raw_unique_companies']}")
     print(f"Companies Fetched (raw postings, pre-dedup): {report['companies_fetched_raw']}")
@@ -1452,12 +1603,19 @@ def print_country_lock_summary(report: dict) -> None:
     print(f"Final Qualified Companies Exported: {report['final_companies_exported']}")
     if report["regions_locked_out"]:
         print(f"Regions locked out (never searched): {', '.join(report['regions_locked_out'])}")
-    status = (
-        f"MAX_COMPANIES limit ({report['max_companies']}) reached"
-        if report["target_reached"]
-        else f"All available valid {report['selected_country']} results exhausted "
-             "(country was never switched to make up the difference)"
-    )
+    if report.get("search_timed_out"):
+        status = (
+            f"OVERALL_SEARCH_TIMEOUT ({report['search_timeout_seconds']}s) reached - "
+            "exported what was already collected rather than continuing "
+            "(country was never switched to make up the difference)"
+        )
+    elif report["target_reached"]:
+        status = f"MAX_COMPANIES limit ({report['max_companies']}) reached"
+    else:
+        status = (
+            f"All available valid {report['selected_country']} results exhausted "
+            "(country was never switched to make up the difference)"
+        )
     print(f"Status                             : {status}")
     print("=" * 70)
 
@@ -1571,6 +1729,15 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     target_leads = _dynamic_lead_target(config, lead_config)
     job_buffer = _job_buffer_for_location(config, target_leads)
 
+    # OVERALL_SEARCH_TIMEOUT: a hard wall-clock ceiling on the search
+    # phase (see load_config's search_timeout_seconds comment). Checked
+    # between queries/countries in search_country/search_region; once
+    # passed, no new query is started and the run moves straight to
+    # exporting what was already collected.
+    start_time = time.monotonic()
+    search_timeout = config.get("search_timeout_seconds", 1800)
+    deadline = start_time + search_timeout
+
     # Fresh source cache for every run while still avoiding repeated feed
     # downloads inside the same run (important for Europe and fallback).
     job_sources.reset_cache()
@@ -1647,7 +1814,9 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
                 pass
 
         kept, dropped, filter_stats, stats = search_region(
-            region, job_title, config, job_buffer, keyword_list
+            region, job_title, config, job_buffer, keyword_list, deadline,
+            progress_callback,
+            {"start_time": start_time, "region": region, "target_leads": target_leads},
         )
         summary["regions_searched"].append(region)
         _merge_region_search_summary(summary, region, kept, dropped, filter_stats, stats, label)
@@ -1724,6 +1893,15 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     )
     summary["final_lead_count"] = len(ctx.data)
     summary["target_reached"] = len(ctx.data) >= target_leads
+    summary["search_elapsed_seconds"] = time.monotonic() - start_time
+    summary["search_timed_out"] = time.monotonic() >= deadline
+    summary["search_timeout_seconds"] = search_timeout
+    if summary["search_timed_out"]:
+        log.warning(
+            f"\n[TIMEOUT] OVERALL_SEARCH_TIMEOUT ({search_timeout}s) reached after "
+            f"{_format_elapsed(summary['search_elapsed_seconds'])} - exporting the "
+            f"{len(ctx.data)} companies already collected instead of continuing."
+        )
 
     ctx.add_artifact("search_summary", summary)
     ctx.add_artifact("dynamic_lead_search", {
@@ -1842,6 +2020,10 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
         "final_companies_exported": final_count,
         "target_reached": final_count >= target_leads,
         "regions_locked_out": [r for r in REGION_ORDER if r != selected],
+        "elapsed_seconds": summary.get("search_elapsed_seconds", 0),
+        "elapsed_formatted": _format_elapsed(summary.get("search_elapsed_seconds", 0)),
+        "search_timed_out": summary.get("search_timed_out", False),
+        "search_timeout_seconds": summary.get("search_timeout_seconds", search_timeout),
     }
     summary["country_lock_report"] = country_lock_report
 

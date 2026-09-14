@@ -187,18 +187,40 @@ def linkedin_search_urls(company_name: str, enabled: bool) -> str:
     return " | ".join(links)
 
 
-def _robots_allows(session, base_url: str, path: str, timeout: int) -> bool:
-    """Check robots.txt before fetching. On any doubt, allow - a missing
-    or unreadable robots.txt is not a disallow - but a real Disallow is
-    obeyed."""
+def _fetch_robots_parser(session, base_url: str, timeout: int):
+    """Fetch and parse one company's robots.txt ONCE.
+
+    Performance fix: this used to be called from inside the per-path loop
+    in fetch_careers_page_contacts, so a company with no match re-fetched
+    the exact same robots.txt URL up to 6 times (once per candidate
+    career-page path) before giving up - a real, measured contributor to
+    the multi-hour run time reported against a large company list. A
+    domain's robots.txt does not vary by path, so it is fetched once per
+    company and the parsed result is reused for every path check.
+
+    Returns a RobotFileParser, or None if robots.txt could not be read
+    (treated as "no restriction" by the caller, same as before).
+    """
     try:
         parsed = urlparse(base_url)
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
         response = session.get(robots_url, timeout=timeout)
         if response.status_code != 200:
-            return True
+            return None
         parser = RobotFileParser()
         parser.parse(response.text.splitlines())
+        return parser
+    except Exception:
+        return None
+
+
+def _robots_allows(parser, base_url: str, path: str) -> bool:
+    """Check one path against an already-fetched robots.txt parser. On
+    any doubt, allow - a missing or unreadable robots.txt is not a
+    disallow - but a real Disallow is obeyed."""
+    if parser is None:
+        return True
+    try:
         return parser.can_fetch("*", urljoin(base_url, path))
     except Exception:
         return True
@@ -238,10 +260,17 @@ def fetch_careers_page_contacts(company_website: str, settings: dict) -> dict:
     except Exception:
         return {}
 
+    # Fetched once per company, not once per candidate path - see
+    # _fetch_robots_parser's docstring.
+    robots_parser = (
+        _fetch_robots_parser(session, website, timeout)
+        if settings.get("respect_robots_txt", True) else None
+    )
+
     for path in [""] + CAREERS_PATHS:
         url = urljoin(website, path) if path else website
         if settings.get("respect_robots_txt", True):
-            if not _robots_allows(session, website, path or "/", timeout):
+            if not _robots_allows(robots_parser, website, path or "/"):
                 continue
         try:
             response = session.get(url, timeout=timeout)

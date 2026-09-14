@@ -33,8 +33,15 @@
 # nothing in main.py or pipeline.py needs to change.
 platforms: ["indeed", "linkedin", "zip_recruiter", "glassdoor", "remoteok", "remotive", "weworkremotely", "jobspresso"]
 
-# Only consider postings from the last N hours (168 = 7 days).
-hours_old: 168
+# Only consider postings from the last N hours (720 = 30 days). Raised
+# from the original 168 (7 days): a 7-day window is one of the two
+# biggest constraints on raw USA company coverage (the other was
+# keyword_expansion.max_keywords below) - most boards' remote-AI postings
+# for a given title simply do not refresh fast enough for a 7-day window
+# to surface more than a couple hundred companies, no matter how many
+# keywords or pages are searched. This still respects the selected
+# country - it only widens the time window, never the location.
+hours_old: 720
 
 # How many results to request per platform, per page, before dedup/capping.
 # Fetching generously here means MAX_COMPANIES (below, in lead_pipeline)
@@ -48,10 +55,15 @@ results_wanted_per_platform: 100
 # companies before a country's available results are exhausted.
 max_pages_per_platform: 10
 
-# Maximum number of rows in the final Excel file. If fewer genuine
-# remote postings exist after filtering, the output will have fewer
-# rows rather than being padded.
-target_total_jobs: 50
+# Maximum number of rows in the "Remote Jobs" audit sheet (and the raw
+# job-posting count reported in logs/summaries). If fewer genuine remote
+# postings exist after filtering, the output will have fewer rows rather
+# than being padded. Raised from the original 50 - with keyword expansion
+# now searching up to max_keywords titles, the true raw posting count
+# regularly exceeds that, and capping the audit sheet at 50 was making
+# the console/API "jobs found" figure look far smaller than what was
+# actually collected and used to build the company list.
+target_total_jobs: 5000
 
 # Lead target controls when the location search stops. This is different
 # from target_total_jobs, which controls the size of the job audit sheet.
@@ -94,7 +106,18 @@ keyword_expansion:
   # extra keyword is another pass over every platform, so this is the
   # main cost/coverage dial. The keyword loop stops early once the
   # target row count is met, so this is a ceiling, not a fixed cost.
-  max_keywords: 6
+  #
+  # Raised from the original 6, which was the single biggest cause of
+  # thin raw company coverage: keywords.py's curated "ai_engineering"
+  # family alone now lists 17 related titles (AI Engineer, Machine
+  # Learning Engineer, Applied AI Engineer, ML Engineer, AI/ML Engineer,
+  # Applied Machine Learning Engineer, AI Software Engineer, Machine
+  # Learning Software Engineer, Deep Learning Engineer, Generative AI
+  # Engineer, LLM Engineer, AI Developer, Machine Learning Developer, NLP
+  # Engineer, Computer Vision Engineer, MLOps Engineer, AI Research
+  # Engineer) and a cap of 6 discarded most of them before a single
+  # platform was ever queried.
+  max_keywords: 20
 
   # Generate "Engineer" <-> "Developer" variants of the title.
   role_noun_synonyms: true

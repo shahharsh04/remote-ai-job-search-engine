@@ -126,11 +126,25 @@ ROLE_FAMILIES = {
         "AI/ML Engineer",
         "Applied Machine Learning Engineer",
         "AI Software Engineer",
+        "Machine Learning Software Engineer",
         "Deep Learning Engineer",
         "Generative AI Engineer",
         "LLM Engineer",
         "AI Developer",
         "Machine Learning Developer",
+        # Adjacent AI specialisms folded into the same family (rather than
+        # left in their own narrower families below) so a plain "AI
+        # Engineer"/"Machine Learning Engineer" search actually reaches
+        # them too - previously these only surfaced when the user typed
+        # the specialism itself, which was the main cause of shallow raw
+        # coverage: _matching_families() only matches a family whose
+        # member titles are a SUBSET of the searched title's own words,
+        # so "AI Engineer" alone could never pull in "NLP Engineer" while
+        # they lived in separate families.
+        "NLP Engineer",
+        "Computer Vision Engineer",
+        "MLOps Engineer",
+        "AI Research Engineer",
     ],
     "mlops_engineering": [
         "MLOps Engineer",
@@ -264,8 +278,12 @@ DEFAULT_BLOCKED_TERMS = [
 
 DEFAULTS = {
     "enabled": True,
-    # Total keywords searched, INCLUDING the user's own title.
-    "max_keywords": 6,
+    # Total keywords searched, INCLUDING the user's own title. Raised from
+    # the original 6: the curated ai_engineering family alone now holds 17
+    # titles, and a cap of 6 was silently discarding most of them before a
+    # single platform was ever queried - the single biggest cause of thin
+    # raw company coverage (see config.yaml's keyword_expansion comment).
+    "max_keywords": 20,
     # Generate "Engineer" <-> "Developer" style variants.
     "role_noun_synonyms": True,
     # Generate the opposite spelling of an abbreviation
@@ -315,8 +333,11 @@ def load_keyword_config(config: dict) -> dict:
     try:
         settings["max_keywords"] = max(1, int(settings["max_keywords"]))
     except (TypeError, ValueError):
-        log.warning("[WARN] keyword_expansion.max_keywords is not a number - using 6.")
-        settings["max_keywords"] = 6
+        log.warning(
+            f"[WARN] keyword_expansion.max_keywords is not a number - using "
+            f"{DEFAULTS['max_keywords']}."
+        )
+        settings["max_keywords"] = DEFAULTS["max_keywords"]
 
     if not isinstance(settings.get("extra_synonyms"), dict):
         settings["extra_synonyms"] = {}

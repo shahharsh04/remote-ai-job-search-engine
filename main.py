@@ -1164,7 +1164,7 @@ def _format_worksheet(worksheet) -> None:
     wide_headers = {
         "Lead Summary": 70, "Matching Job URLs": 55, "Matching Job Titles": 45,
         "Priority Reason": 55, "Reason": 55, "LinkedIn Search Links": 45,
-        "job_description": 70,
+        "job_description": 70, "Job Description": 70,
         "Hiring Signal": 30, "Company Website": 32, "Contact Email": 30,
         "Contact LinkedIn URL": 34, "Contact Source": 30, "Exclusion Reason": 34,
         "Company Name": 30, "Value": 60, "Metric": 45, "job_url": 34,
@@ -1182,6 +1182,7 @@ def _format_worksheet(worksheet) -> None:
         "Region": 12, "Date Fetched": 13, "Contact Confidence": 13,
         "is_remote": 10, "Buyer Probability": 15, "ICP Fit Score": 13,
         "Source": 20, "Search Query": 26, "Search Page": 12, "Collected At": 18,
+        "Job ID": 22, "Posted Date": 15,
     }
     for col_idx in range(1, worksheet.max_column + 1):
         letter = get_column_letter(col_idx)
@@ -1407,71 +1408,13 @@ def print_summary(summary: dict, final_count: int, target_leads: int,
 # Company-level lead sheet: the primary output, one row per company.
 # Separate from OUTPUT_COLUMNS, which stays exactly as the brief fixed it
 # for the job-level sheet.
-LEAD_COLUMNS = {
-    "Lead Priority": "lead_priority",
-    # Buyer Probability (High/Medium/Low): the plain, un-promoted
-    # classification tier. Low-probability-buyer companies (staffing/
-    # recruitment/IT-services/AI-consulting/outsourcing/BPO - see the
-    # Low Probability Buyer Dictionary in pipeline.IcpFilteringStage and
-    # icp.COMPETITOR_DICTIONARY) are capped here at "Low" and are always
-    # included in this sheet, never discarded - see lead_signals.score_company.
-    "Buyer Probability": "buyer_probability",
-    "Priority Score": "priority_score",
-    "ICP Fit Score": "icp_fit_score",
-    "Company Name": "company_name",
-    "Company Website": "company_url_direct",
-    "Company Domain": "company_domain",
-    "Industry": "company_industry",
-    "Location": "locations",
-    "Employee Count": "employee_count",
-    "Company Size": "company_size",
-    "Company Type": "company_type",
-    "ICP Status": "icp_status",
-    "Reason": "priority_reason",
-    "Source": "source_platforms",
-    "Lead Summary": "lead_summary",
-    "Matching Position Count": "matching_position_count",
-    "Matching Job Titles": "matching_job_titles",
-    "Matching Job URLs": "matching_job_urls",
-    # Why this company is in the list: what was searched for, and which
-    # of the expanded keywords its postings came back under.
-    "Searched Title": "original_job_title",
-    "Matched Keywords": "search_keywords",
-    "Hiring Signal": "hiring_signal",
-    "Hiring Signal Strength": "hiring_signal_strength",
-    "AI Hiring Stage": "ai_hiring_stage",
-    "Funding Signal": "funding_signal",
-    "Contact Status": "contact_status",
-    "Contact Name": "contact_name",
-    "Contact Title": "contact_title",
-    "Contact Email": "contact_email",
-    "Contact Email (2nd)": "contact_email_secondary",
-    "Contact Source": "contact_source",
-    # Preserved exactly as before - not removed, not renamed.
-    "LinkedIn Search Links": "contact_search_urls",
-    "Country": "country",
-    "Region": "region",
-    "Date Fetched": "date_fetched",
-}
-
-# Blank cells read as missing data; these say so explicitly instead.
-NOT_AVAILABLE_DEFAULTS = {
-    "Buyer Probability": "Unknown",
-    "Industry": "Unknown",
-    "Location": "Unknown",
-    "Reason": "Not Available",
-    "Source": "Unknown",
-    "Employee Count": "Unknown",
-    "Company Size": "Unknown",
-    "Company Type": "Unknown",
-    "Contact Status": "Contact: Not Found",
-    "Hiring Signal Strength": "Unknown",
-    "Contact Strength": "None",
-    "Contact Name": "Not Found",
-    "Contact Title": "Not Found",
-    "Funding Signal": "Not Found",
-}
-
+# ---------------------------------------------------------------------
+# The final workbook has EXACTLY 3 sheets - Qualified Leads, Raw Jobs
+# Found, Excluded Companies. No other sheet (Search Summary, Pipeline
+# Summary, All Company Signals, Remote Jobs, etc.) is written to Excel
+# any more; that kind of run-level detail stays in the console/API
+# summary (print_country_lock_summary, print_pipeline_report) instead.
+# ---------------------------------------------------------------------
 
 def _shape_sheet(df: pd.DataFrame, columns_map: dict, defaults: dict = None) -> pd.DataFrame:
     """Shared column-mapping/renaming/defaulting logic for every Excel
@@ -1497,28 +1440,19 @@ def _shape_sheet(df: pd.DataFrame, columns_map: dict, defaults: dict = None) -> 
     return output.reset_index(drop=True)
 
 
-def shape_lead_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    """Put company rows into the lead column order.
-
-    Anything a source did not provide is filled with an explicit
-    "Unknown"/"Not Found" rather than a blank or a guess.
-    """
-    if df is not None and not df.empty and "date_fetched" not in df.columns:
-        df = df.copy()
-        df["date_fetched"] = date.today().isoformat()
-    return _shape_sheet(df, LEAD_COLUMNS, NOT_AVAILABLE_DEFAULTS)
-
-
-# Sheet: "Qualified Companies" - the trimmed, business-facing view of the
-# final qualified/prioritised result (same source data as "Qualified
-# Leads"/"All Company Signals", just the specific column set asked for -
-# nothing here is a different computation or a different data source).
-QUALIFIED_COMPANY_COLUMNS = {
+# Sheet 1: "Qualified Leads" - the final, scored, MAX_QUALIFIED_LEADS-
+# capped result. High, Medium AND Low Buyer Probability companies are
+# all included (nothing is discarded by the Low Probability Buyer
+# Dictionary - see pipeline.IcpFilteringStage / lead_signals.score_company).
+QUALIFIED_LEADS_COLUMNS = {
     "Company Name": "company_name",
     "Company Domain": "company_domain",
     "Company Website": "company_url_direct",
-    "Industry": "company_industry",
+    "Job Title": "matching_job_titles",
+    "Job URL": "matching_job_urls",
     "Location": "locations",
+    "Country": "country",
+    "Industry": "company_industry",
     "Company Size": "company_size",
     "Buyer Probability": "buyer_probability",
     "ICP Fit Score": "icp_fit_score",
@@ -1529,75 +1463,130 @@ QUALIFIED_COMPANY_COLUMNS = {
     "LinkedIn Search Links": "contact_search_urls",
 }
 
+QUALIFIED_LEADS_DEFAULTS = {
+    "Company Domain": "Unknown", "Company Website": "Unknown",
+    "Job Title": "Unknown", "Job URL": "Unknown", "Location": "Unknown",
+    "Country": "Unknown", "Industry": "Unknown", "Company Size": "Unknown",
+    "Buyer Probability": "Unknown", "Reason": "Not Available",
+    "Source": "Unknown",
+}
 
-def shape_qualified_companies_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    """QUALIFIED RESULTS stage output, in the exact column set requested:
-    the post-dedup, post-ICP/Buyer-Probability, post-scoring company list
-    (High, Medium AND Low probability - none discarded)."""
-    return _shape_sheet(df, QUALIFIED_COMPANY_COLUMNS, NOT_AVAILABLE_DEFAULTS)
+
+def shape_qualified_leads_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """Sheet 1: "Qualified Leads" - one row per qualified company, in the
+    exact column set requested. A company can have multiple matched job
+    postings; Job Title/Job URL join all of them (pipe-separated) rather
+    than picking one arbitrarily."""
+    return _shape_sheet(df, QUALIFIED_LEADS_COLUMNS, QUALIFIED_LEADS_DEFAULTS)
 
 
-# Sheet: "Raw Companies" - the RAW SEARCH RESULTS stage, before company
-# dedup/ICP/scoring: one row per job posting actually collected (already
-# country-validated and recency-filtered), so the full breadth of what
-# was found is visible even though many rows here share one company.
-RAW_COMPANY_COLUMNS = {
+# Sheet 2: "Raw Jobs Found" - every job posting actually collected for
+# the locked country (already country-validated and recency-filtered),
+# BEFORE company dedup/ICP/scoring - one row per raw job posting, not
+# per company, and NOT capped or replaced by the qualified-leads count.
+RAW_JOBS_COLUMNS = {
+    "Job Title": "title",
     "Company Name": "company",
     "Company Domain": "_company_domain",
     "Company Website": "company_url_direct",
-    "Job Title": "title",
     "Job URL": "job_url",
     "Location": "location",
     "Country": "country",
-    "Industry": "company_industry",
-    "Company Size": "company_num_employees",
+    "Job Description": "description",
     "Source": "site",
     "Search Query": "search_keyword",
     "Search Page": "_search_page",
+    # JobSpy (Indeed/LinkedIn/ZipRecruiter/Glassdoor) provides a real
+    # `id` column; the dedicated remote-board connectors (RemoteOK,
+    # Remotive, We Work Remotely, Jobspresso) do not expose a separate
+    # id distinct from the job URL, so this is "Not Available" there -
+    # never a fabricated id.
+    "Job ID": "id",
+    "Posted Date": "date_posted",
     "Collected At": "_collected_at",
 }
 
-RAW_COMPANY_DEFAULTS = {
+RAW_JOBS_DEFAULTS = {
     "Company Domain": "Unknown", "Company Website": "Unknown",
-    "Industry": "Unknown", "Company Size": "Unknown",
+    "Job Description": "Not Available", "Job ID": "Not Available",
+    "Posted Date": "Unknown",
 }
 
 
-def shape_raw_companies_sheet(job_level_df: pd.DataFrame) -> pd.DataFrame:
-    """RAW SEARCH RESULTS stage output: every job posting collected for
-    the locked country, deliberately NOT capped or deduplicated to one
-    row per company - see the Qualified Companies/Qualified Leads sheets
-    for the deduplicated, scored result. This is what makes the raw
-    search breadth auditable instead of only visible as a summary count.
+def shape_raw_jobs_sheet(job_level_df: pd.DataFrame) -> pd.DataFrame:
+    """Sheet 2: "Raw Jobs Found" - the RAW SEARCH RESULTS stage output,
+    deliberately NOT capped or deduplicated to one row per company (see
+    the Qualified Leads sheet for that). This is what makes the raw
+    search breadth auditable instead of only visible as a summary count -
+    e.g. an "N raw USA jobs fetched" figure is these N actual rows.
     """
-    return _shape_sheet(job_level_df, RAW_COMPANY_COLUMNS, RAW_COMPANY_DEFAULTS)
+    shaped = _shape_sheet(job_level_df, RAW_JOBS_COLUMNS, RAW_JOBS_DEFAULTS)
+    if "Job Description" in shaped.columns:
+        shaped["Job Description"] = shaped["Job Description"].apply(truncate_description)
+    return shaped
 
 
-def build_search_summary_sheet(country_lock_report: dict) -> pd.DataFrame:
-    """The "Search Summary" sheet: one compact Metric/Value view of the
-    run, built directly from country_lock_report (the same dict the
-    console "COUNTRY LOCK / MAX_COMPANIES SUMMARY" prints and the API
-    returns), so the Excel sheet, the console output and the API status
-    payload can never drift out of sync with each other.
+# Sheet 3: "Excluded Companies" - every scored company that did NOT make
+# the final Qualified Leads cut, sourced from
+# lead_signals.select_final_leads's own `not_selected` return value (the
+# real ranking result the pipeline already computed) rather than a
+# separate re-derivation, so the reason given here is always the actual
+# filtering outcome, never invented.
+EXCLUDED_COMPANIES_COLUMNS = {
+    "Company Name": "company_name",
+    "Company Domain": "company_domain",
+    "Company Website": "company_url_direct",
+    "Job Title": "matching_job_titles",
+    "Location": "locations",
+    "Country": "country",
+    "Buyer Probability": "buyer_probability",
+    "ICP Fit Score": "icp_fit_score",
+    "Priority Score": "priority_score",
+    "Exclusion Reason": "_exclusion_reason_computed",
+    "Source": "source_platforms",
+    "LinkedIn Search Links": "contact_search_urls",
+}
+
+EXCLUDED_COMPANIES_DEFAULTS = {
+    "Company Domain": "Unknown", "Company Website": "Unknown",
+    "Job Title": "Unknown", "Location": "Unknown", "Country": "Unknown",
+    "Buyer Probability": "Unknown", "Source": "Unknown",
+}
+
+
+def build_excluded_companies_sheet(not_selected: pd.DataFrame, max_qualified_leads: int) -> pd.DataFrame:
+    """Sheet 3: "Excluded Companies". Two real, code-derived reasons -
+    nothing invented:
+
+      1. A company matching a recognised low-probability-buyer type
+         (staffing/recruitment/IT-services/AI-consulting/outsourcing/BPO
+         - the Low Probability Buyer Dictionary) carries its actual
+         ICP-classification reason, e.g. "staffing_agency - matched
+         'staffing agency' in company_industry" - exactly what
+         icp.evaluate_company / pipeline.IcpFilteringStage determined.
+      2. Everything else here simply scored too low to rank into the
+         top max_qualified_leads by priority score - the real reason
+         lead_signals.select_final_leads cut it, stated with the actual
+         score so it can be checked against the Qualified Leads sheet.
     """
-    r = country_lock_report or {}
-    rows = [
-        ("Selected Country", r.get("selected_country", "")),
-        ("Target Companies", r.get("max_companies", "")),
-        ("Total Jobs", r.get("raw_jobs_total", 0)),
-        ("Raw Companies", r.get("raw_unique_companies", 0)),
-        ("Duplicates Removed", r.get("duplicate_postings_merged", 0)),
-        ("Country Mismatch", r.get("invalid_country_removed", 0)),
-        ("ICP Excluded (Low-Probability Buyers, kept & scored Low)", r.get("low_probability_buyers", 0)),
-        ("High Probability", r.get("high_probability", 0)),
-        ("Medium Probability", r.get("medium_probability", 0)),
-        ("Low Probability", r.get("low_probability", 0)),
-        ("Final Qualified Companies", r.get("final_companies_exported", 0)),
-        ("Queries Used", r.get("num_queries", 0)),
-        ("Pages Searched", r.get("pages_searched", 0)),
-        ("Execution Time", r.get("elapsed_formatted", "")),
-    ]
-    return pd.DataFrame(rows, columns=["Metric", "Value"])
+    if not_selected is None or not_selected.empty:
+        return pd.DataFrame(columns=list(EXCLUDED_COMPANIES_COLUMNS.keys()))
+
+    df = not_selected.copy()
+
+    def _reason(row) -> str:
+        if bool(row.get("is_low_probability_buyer")):
+            existing = str(row.get("exclusion_reason") or "").strip()
+            return existing if existing and existing.lower() != "nan" else \
+                "Low-probability buyer (see Buyer Probability column)"
+        score = row.get("priority_score", "Unknown")
+        return (
+            f"Not selected for the final list - ranked below the top "
+            f"{max_qualified_leads} companies by priority score (priority score: {score})"
+        )
+
+    df["_exclusion_reason_computed"] = df.apply(_reason, axis=1)
+    return _shape_sheet(df, EXCLUDED_COMPANIES_COLUMNS, EXCLUDED_COMPANIES_DEFAULTS)
 
 
 def build_pipeline_summary_sheet(ctx, jobs_count: int, leads_count: int) -> pd.DataFrame:
@@ -2035,39 +2024,43 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     if job_level is None:
         job_level = ctx.data
 
-    # The main business output is the final MAX_COMPANIES-capped leads.
-    # The job audit sheet can still be capped independently at
-    # target_total_jobs (raised so it reflects real collected volume).
-    jobs_sheet = cap_and_reshape(job_level, config["target_total_jobs"])
-    leads_sheet = shape_lead_sheet(ctx.data)
+    # jobs_count (for the console/API "jobs found" stat) is the real
+    # total raw job rows collected - not capped, not reshaped into an
+    # Excel sheet (there is no "Remote Jobs" sheet any more).
+    jobs_count = len(job_level)
 
-    all_signals = ctx.artifacts.get("all_company_signals")
     excluded = ctx.artifacts.get("excluded_companies")
+    # Every scored company that did NOT make the final cut - the real
+    # ranking result lead_signals.select_final_leads already computed -
+    # is the source for the "Excluded Companies" sheet below.
+    not_selected = ctx.artifacts.get("not_selected_companies")
 
-    # RAW SEARCH RESULTS stage output - every job posting actually
-    # collected for the locked country (country-validated, recency-
-    # filtered), deliberately NOT capped or deduplicated to one row per
-    # company - see requirement "Separate RAW DATA from QUALIFIED DATA".
-    raw_companies_sheet = shape_raw_companies_sheet(job_level)
-    # QUALIFIED RESULTS stage output, in the exact trimmed column set
-    # requested - same source data/scoring as "Qualified Leads" above,
-    # just a narrower view. High, Medium AND Low probability companies
-    # are all present; none are discarded.
-    qualified_companies_sheet = shape_qualified_companies_sheet(ctx.data)
+    # Sheet 1: "Qualified Leads" - the final, scored, MAX_QUALIFIED_LEADS-
+    # capped result.
+    qualified_leads_sheet = shape_qualified_leads_sheet(ctx.data)
+    # Sheet 2: "Raw Jobs Found" - every job posting actually collected
+    # for the locked country (country-validated, recency-filtered),
+    # BEFORE company dedup/ICP/scoring - see requirement "the raw sheet
+    # must be created before ICP filtering, not replaced by qualified
+    # leads".
+    raw_jobs_sheet = shape_raw_jobs_sheet(job_level)
 
-    # Country-lock / MAX_COMPANIES summary (requirements 4 and 11): one
-    # consolidated report of what was fetched, filtered, and exported for
-    # the selected country, built from the same artifacts as everything
-    # else above rather than a separate tracking mechanism. Computed here
-    # (before `sheets`) so it can also become the "Search Summary" sheet.
+    # Country-lock / MAX_QUALIFIED_LEADS summary: one consolidated report
+    # of what was fetched, filtered, and exported for the selected
+    # country. No longer written as its own Excel sheet - only the
+    # console/API summary and (via low_probability_buyers/priority_score)
+    # the Excluded Companies sheet's reasons use it.
     dedup_stats = ctx.artifacts.get("company_dedup_stats", {})
     icp_stats = ctx.artifacts.get("icp_stats", {})
     contact_stats = ctx.artifacts.get("contact_stats", {})
     selection = ctx.artifacts.get("selection_stats", {})
     buyer_counts = selection.get("buyer_probability_counts", {})
 
+    # Sheet 3: "Excluded Companies".
+    excluded_companies_sheet = build_excluded_companies_sheet(not_selected, target_leads)
+
     search_totals = _sum_search_stats(summary.get("region_stats", {}))
-    final_count = len(leads_sheet)
+    final_count = len(qualified_leads_sheet)
     # "Duplicates removed" = raw postings collected minus the job-level
     # rows that actually reached company grouping (job-level dedup, see
     # main.deduplicate) PLUS the postings company-identity merged into an
@@ -2106,19 +2099,12 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     }
     summary["country_lock_report"] = country_lock_report
 
+    # EXACTLY 3 sheets in the final workbook - nothing else. Order here
+    # is the order they appear in the file.
     sheets = {
-        "Qualified Leads": leads_sheet,
-        "Qualified Companies": qualified_companies_sheet,
-        "Raw Companies": raw_companies_sheet,
-        "Search Summary": build_search_summary_sheet(country_lock_report),
-        "All Company Signals": shape_lead_sheet(all_signals),
-        "Excluded Companies": _drop_internal(excluded)
-        if excluded is not None and not excluded.empty
-        else pd.DataFrame({"Note": ["No companies were excluded in this run."]}),
-        "Pipeline Summary": build_pipeline_summary_sheet(
-            ctx, len(jobs_sheet), len(leads_sheet)
-        ),
-        "Remote Jobs": jobs_sheet,
+        "Qualified Leads": qualified_leads_sheet,
+        "Raw Jobs Found": raw_jobs_sheet,
+        "Excluded Companies": excluded_companies_sheet,
     }
 
     output_path = export_to_excel(sheets, config["output_dir"], run_token)
@@ -2132,19 +2118,18 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
         "job_dedup_counts",
         {"by_url": 0, "by_fallback_key": 0, "by_title_company": 0},
     )
-    capped_rows = job_level.head(config["target_total_jobs"])
     if "_region" in job_level.columns:
-        capped = capped_rows["_region"].tolist()
+        region_col = job_level["_region"].tolist()
     else:
-        capped = []
+        region_col = []
     counts = {}
-    for region in capped:
+    for region in region_col:
         counts[region] = counts.get(region, 0) + 1
     summary["export_region_counts"] = counts
 
     keyword_counts_export = {k: 0 for k in expansion.get("keywords", [])}
-    if "search_keyword" in capped_rows.columns:
-        for value in capped_rows["search_keyword"]:
+    if "search_keyword" in job_level.columns:
+        for value in job_level["search_keyword"]:
             keyword_counts_export[value] = keyword_counts_export.get(value, 0) + 1
     summary["keyword_counts"] = keyword_counts_export
 
@@ -2153,7 +2138,7 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
             progress_callback({
                 "stage": "Completed",
                 "target_leads": target_leads,
-                "current_leads": len(leads_sheet),
+                "current_leads": final_count,
                 "regions_searched": summary["regions_searched"],
                 "regions_skipped": summary["regions_skipped"],
                 "high_priority_leads": selection.get("priority_counts", {}).get("High", 0),
@@ -2168,8 +2153,8 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
         "output_path": output_path,
         "excluded_path": excluded_path,
         "summary": summary,
-        "jobs_count": len(jobs_sheet),
-        "leads_count": len(leads_sheet),
+        "jobs_count": jobs_count,
+        "leads_count": final_count,
         "unique_companies": dedup_stats.get("companies", 0),
         "excluded_companies": icp_stats.get("excluded", 0),
         "qualified_companies": icp_stats.get("qualified", 0),

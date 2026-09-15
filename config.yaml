@@ -7,7 +7,7 @@
 #
 # STRICT COUNTRY LOCK: whichever region/country is selected at the
 # prompt is the only one ever searched for that run. The system never
-# falls back to another country to reach MAX_COMPANIES below - see
+# falls back to another country to reach MAX_QUALIFIED_LEADS below - see
 # main.py's REGION_DEFINITIONS note and execute_pipeline().
 # =============================================================================
 
@@ -44,15 +44,15 @@ platforms: ["indeed", "linkedin", "zip_recruiter", "glassdoor", "remoteok", "rem
 hours_old: 720
 
 # How many results to request per platform, per page, before dedup/capping.
-# Fetching generously here means MAX_COMPANIES (below, in lead_pipeline)
-# is more likely to be reached after duplicates are removed.
+# Fetching generously here means MAX_QUALIFIED_LEADS (below, in
+# lead_pipeline) is more likely to be reached after duplicates are removed.
 results_wanted_per_platform: 100
 
 # How many pages to page through per platform (via JobSpy's `offset`).
 # Raising this collects more jobs when a platform has them; it does not
-# invent jobs when a platform has run out. Sized up alongside
-# MAX_COMPANIES=1000 so pagination can actually reach that many unique
-# companies before a country's available results are exhausted.
+# invent jobs when a platform has run out. Sized up so pagination can
+# actually reach MAX_QUALIFIED_LEADS worth of unique companies before a
+# country's available results are exhausted.
 max_pages_per_platform: 10
 
 # How many of the configured platforms are fetched concurrently for one
@@ -68,14 +68,12 @@ max_pages_per_platform: 10
 # benefit past the number of configured platforms).
 platform_fetch_concurrency: 4
 
-# Maximum number of rows in the "Remote Jobs" audit sheet (and the raw
-# job-posting count reported in logs/summaries). If fewer genuine remote
-# postings exist after filtering, the output will have fewer rows rather
-# than being padded. Raised from the original 50 - with keyword expansion
-# now searching up to max_keywords titles, the true raw posting count
-# regularly exceeds that, and capping the audit sheet at 50 was making
-# the console/API "jobs found" figure look far smaller than what was
-# actually collected and used to build the company list.
+# NOTE: no longer caps the "Raw Jobs Found" Excel sheet - that sheet
+# deliberately contains every raw job row collected, uncapped, so it can
+# never be smaller than what was actually fetched (see requirement "do
+# not replace raw jobs with qualified jobs"). This setting only bounds
+# the legacy collect_jobs()/cap_and_reshape() CLI helper, which the live
+# search path (execute_pipeline) does not call.
 target_total_jobs: 5000
 
 # OVERALL_SEARCH_TIMEOUT (seconds). The single ceiling on how long one run
@@ -87,8 +85,8 @@ target_total_jobs: 5000
 # each LinkedIn-touching query alone typically costs 1-3 minutes purely
 # from JobSpy's own built-in anti-detection pacing, which this project
 # does not attempt to bypass or shorten. Raise it if you want a run to
-# keep searching longer toward MAX_COMPANIES; lower it for a faster,
-# smaller-but-bounded run.
+# keep searching longer toward MAX_QUALIFIED_LEADS; lower it for a
+# faster, smaller-but-bounded run.
 search_timeout_seconds: 1800
 
 # Lead target controls when the location search stops. This is different
@@ -247,19 +245,23 @@ lead_pipeline:
   medium_priority_employee_threshold: 500
   low_priority_employee_threshold: 5000
 
-  # ---- Final company list ----------------------------------------------
-  # MAX_COMPANIES: the single configurable ceiling on how many unique
-  # companies are collected and exported. This is a MAXIMUM, not a fixed
-  # target - fewer are exported when fewer valid, country-locked
-  # companies exist, and the run is NEVER padded and NEVER switches the
-  # user's selected country to make up the difference. The list is
+  # ---- Final qualified-leads list ---------------------------------------
+  # MAX_QUALIFIED_LEADS: the single configurable ceiling on how many
+  # qualified leads are collected and exported to the "Qualified Leads"
+  # sheet. This is a MAXIMUM, not a fixed target - the system keeps
+  # searching (more queries, more pages) until either this many qualified
+  # leads are found or every configured query/page for the selected
+  # country is exhausted; fewer are exported when fewer valid, country-
+  # locked leads exist, and the run is NEVER padded and NEVER switches
+  # the user's selected country to make up the difference. The list is
   # always sorted High -> Medium -> Low by priority score.
   #
-  # (target_leads/max_final_leads/min_final_leads are legacy setting
-  # names kept only for older config files; if present without
-  # max_companies they are read as an alias for it. Set max_companies
-  # here - it is the one setting this system actually needs.)
-  max_companies: 1000
+  # (max_companies/target_leads/max_final_leads/min_final_leads are
+  # legacy setting names kept only for older config files; if present
+  # without max_qualified_leads they are read as an alias for it. Set
+  # max_qualified_leads here - it is the one setting this system
+  # actually needs.)
+  max_qualified_leads: 50
 
   # ---- Buyer Probability / Low Probability Buyer Dictionary -----------
   # Company types whose primary business competes with an AI

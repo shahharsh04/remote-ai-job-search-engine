@@ -51,22 +51,27 @@ LEAD_CONFIG_DEFAULTS = {
     "medium_priority_employee_threshold": 500,
     "low_priority_employee_threshold": 5000,
 
-    # MAX_COMPANIES - the single configurable ceiling on how many unique
-    # companies are collected and exported (requirement: "Configurable
-    # Company Limit"). This is a MAXIMUM, not a fixed target: the run
-    # exports fewer when fewer valid, country-locked companies exist -
-    # never padded, and the selected country is never changed to make up
-    # the difference (see main.py's strict country lock).
+    # MAX_QUALIFIED_LEADS - the single configurable ceiling on how many
+    # qualified leads are collected and exported. This is a MAXIMUM, not
+    # a fixed target: the run exports fewer when fewer valid, country-
+    # locked qualified leads exist - never padded, and the selected
+    # country is never changed to make up the difference (see main.py's
+    # strict country lock). The system keeps searching (more queries,
+    # more pages) until either this many qualified leads are found or
+    # every configured query/page for the selected country is exhausted.
     #
-    # target_leads/max_final_leads/min_final_leads below are internal
-    # aliases kept only because the rest of the codebase (main.py, api.py)
-    # already reads lead_config["target_leads"]; load_lead_config always
-    # overwrites all three from max_companies, so 1000 is defined in
-    # exactly one place rather than hardcoded in several.
-    "max_companies": 1000,
-    "target_leads": 1000,
-    "max_final_leads": 1000,
-    "min_final_leads": 1000,
+    # max_companies is accepted as an older alias for the same setting
+    # (an earlier iteration of this project called it that); target_leads/
+    # max_final_leads/min_final_leads below are internal aliases kept
+    # only because the rest of the codebase (main.py, api.py) already
+    # reads lead_config["target_leads"] - load_lead_config always
+    # overwrites all of these from max_qualified_leads, so the number is
+    # defined in exactly one place rather than hardcoded in several.
+    "max_qualified_leads": 50,
+    "max_companies": 50,
+    "target_leads": 50,
+    "max_final_leads": 50,
+    "min_final_leads": 50,
 
     # Keep low-probability-buyer companies (flagged by ICP filtering, not
     # discarded) recorded in their own persistent file - the Low
@@ -183,7 +188,8 @@ def load_lead_config(config: dict) -> dict:
     for key in (
         "preferred_min_employees", "preferred_max_employees",
         "medium_priority_employee_threshold", "low_priority_employee_threshold",
-        "max_companies", "target_leads", "max_final_leads", "min_final_leads",
+        "max_qualified_leads", "max_companies", "target_leads",
+        "max_final_leads", "min_final_leads",
     ):
         value = lead_config[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -224,22 +230,29 @@ def load_lead_config(config: dict) -> dict:
         lead_config["low_priority_employee_threshold"] = \
             LEAD_CONFIG_DEFAULTS["low_priority_employee_threshold"]
 
-    # MAX_COMPANIES is the one setting a non-engineer should ever need to
-    # change. A config written before this setting existed may still set
-    # `target_leads` directly - honour that as the value instead of
-    # silently reverting to the 1000 default.
-    if "max_companies" not in raw and "target_leads" in raw:
-        lead_config["max_companies"] = lead_config["target_leads"]
+    # MAX_QUALIFIED_LEADS is the one setting a non-engineer should ever
+    # need to change. Older config files may set `max_companies` or
+    # `target_leads` directly instead - honour whichever of these was
+    # actually supplied, in order of preference, rather than silently
+    # reverting to the default. max_qualified_leads wins if given.
+    if "max_qualified_leads" in raw:
+        pass  # already loaded above; nothing to alias.
+    elif "max_companies" in raw:
+        lead_config["max_qualified_leads"] = lead_config["max_companies"]
+    elif "target_leads" in raw:
+        lead_config["max_qualified_leads"] = lead_config["target_leads"]
 
-    if lead_config["max_companies"] <= 0:
-        problems.append("max_companies must be greater than zero")
-        lead_config["max_companies"] = LEAD_CONFIG_DEFAULTS["max_companies"]
+    if lead_config["max_qualified_leads"] <= 0:
+        problems.append("max_qualified_leads must be greater than zero")
+        lead_config["max_qualified_leads"] = LEAD_CONFIG_DEFAULTS["max_qualified_leads"]
 
-    # target_leads/max_final_leads/min_final_leads are internal aliases,
-    # always derived from max_companies so the ceiling is defined once.
-    lead_config["target_leads"] = lead_config["max_companies"]
-    lead_config["max_final_leads"] = lead_config["max_companies"]
-    lead_config["min_final_leads"] = lead_config["max_companies"]
+    # max_companies/target_leads/max_final_leads/min_final_leads are
+    # internal aliases, always derived from max_qualified_leads so the
+    # ceiling is defined once.
+    lead_config["max_companies"] = lead_config["max_qualified_leads"]
+    lead_config["target_leads"] = lead_config["max_qualified_leads"]
+    lead_config["max_final_leads"] = lead_config["max_qualified_leads"]
+    lead_config["min_final_leads"] = lead_config["max_qualified_leads"]
 
     bands = lead_config["scoring"]["priority_bands"]
     if bands.get("medium_min_score", 0) > bands.get("high_min_score", 0):

@@ -14,7 +14,23 @@ const API_BASE = (window.APP_CONFIG && window.APP_CONFIG.API_BASE_URL
 // A run takes minutes, so the page polls rather than waiting on one
 // long request that the browser would abandon.
 const POLL_INTERVAL_MS = 3000;
-const MAX_POLL_MINUTES = 20;
+// Must comfortably exceed the backend's own worst case: up to
+// search_timeout_seconds (1800s/30min default) for job collection, plus
+// enrichment_stage_timeout_seconds (300s/5min default) for contact
+// enrichment, plus the other pipeline stages (fast - seconds, not
+// minutes). 20 minutes here used to be shorter than the backend's own
+// bound, so a genuinely-still-working search looked abandoned and the
+// completed Excel file's reference was never shown, even though the
+// backend finished it moments later - see MAX_CONSECUTIVE_POLL_FAILURES
+// below for the related "one blip looks fatal" issue.
+const MAX_POLL_MINUTES = 50;
+// A single failed poll (a brief network hiccup, or the backend cutting
+// over during a redeploy) used to be treated as fatal immediately,
+// which could hide a search that was still running fine. Only give up
+// after several consecutive failures - roughly 5 x POLL_INTERVAL_MS -
+// so a momentary blip doesn't lose a real result.
+const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+let consecutivePollFailures = 0;
 
 const FALLBACK_REGIONS = [
   { name: "USA", countries: ["USA"] },
@@ -149,6 +165,26 @@ function describeCounts(run) {
   } excluded${priority}.${progress}${locationText}${alsoSearched}`;
 }
 
+function pollFailedTemporarily(title, detail) {
+  // A single failed poll - a brief network hiccup, or the backend
+  // cutting over mid-redeploy - used to be treated as fatal immediately
+  // and could hide a search that was actually still running fine (or
+  // had already finished with a downloadable Excel file the page then
+  // never showed). Only give up after several consecutive failures.
+  consecutivePollFailures += 1;
+  if (consecutivePollFailures < MAX_CONSECUTIVE_POLL_FAILURES) {
+    setStatus(
+      "loading",
+      "Reconnecting…",
+      `${detail} (retry ${consecutivePollFailures}/${MAX_CONSECUTIVE_POLL_FAILURES - 1})`
+    );
+    return;
+  }
+  stopPolling();
+  setBusy(false);
+  setStatus("error", title, detail);
+}
+
 async function pollStatus() {
   if (!currentRunId) return;
 
@@ -156,19 +192,37 @@ async function pollStatus() {
   try {
     response = await fetch(`${API_BASE}/api/status/${currentRunId}`);
   } catch (error) {
-    stopPolling();
-    setBusy(false);
-    setStatus("error", "Lost connection to the backend", "The search may still be running on the server.");
+    pollFailedTemporarily(
+      "Lost connection to the backend",
+      "The search may still be running on the server."
+    );
+    return;
+  }
+
+  if (response.status === 404) {
+    // Unlike a transient network/5xx blip, a 404 means a RESPONDING
+    // server was asked about this run id and genuinely does not have
+    // it - almost always because the backend process restarted (a
+    // redeploy) and its in-memory run state was lost with it. Retrying
+    // will not recover it, but a brief moment during cutover to a new
+    // instance can still look like this, so the same short retry
+    // budget is used before showing the (now much clearer) explanation
+    // instead of a bare "Unknown run id".
+    pollFailedTemporarily(
+      "Lost track of this search",
+      "The backend appears to have restarted since this search started, so its status " +
+        "is no longer available. If it had already produced a result, that Excel file " +
+        "cannot be recovered from here - please start a new search."
+    );
     return;
   }
 
   if (!response.ok) {
-    stopPolling();
-    setBusy(false);
-    setStatus("error", "Could not read the run status", await readError(response));
+    pollFailedTemporarily("Could not read the run status", await readError(response));
     return;
   }
 
+  consecutivePollFailures = 0;
   const run = await response.json();
 
   if (run.status === "completed") {
@@ -268,6 +322,7 @@ form.addEventListener("submit", async (event) => {
   }
 
   stopPolling();
+  consecutivePollFailures = 0;
   results.hidden = true;
   downloadButton.hidden = true;
   setBusy(true);

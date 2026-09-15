@@ -1232,21 +1232,43 @@ def _format_worksheet(worksheet) -> None:
         worksheet.row_dimensions[row_idx].height = 45
 
 
-def export_to_excel(sheets, output_dir: str) -> str:
+def new_run_token() -> str:
+    """A per-run token (date + time, second precision) used to make every
+    exported file's name unique to the run that produced it.
+
+    Bug this fixes: every export filename used to be date-only
+    (remote_ai_jobs_{date}.xlsx). On a server, running two searches on
+    the same calendar day - completely normal usage, not an edge case -
+    made the second run SILENTLY OVERWRITE the first run's .xlsx on disk
+    (no PermissionError to trigger the locked-file fallback below, since
+    nothing has the file open outside of Excel-on-a-desktop). A run whose
+    `output_path` pointed at that shared filename would then serve
+    whichever run wrote last - wrong data, or a half-written file if the
+    download raced the overwrite - looking exactly like "the Excel file
+    is sometimes not generated/not returned" from the outside. Every
+    exported file for one run now shares this one token, so two runs
+    started even a second apart never collide.
+    """
+    return datetime.now().strftime("%Y-%m-%d_%H%M%S")
+
+
+def export_to_excel(sheets, output_dir: str, run_token: str = None) -> str:
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    file_path = out_path / f"remote_ai_jobs_{date.today().isoformat()}.xlsx"
+    token = run_token or new_run_token()
+    file_path = out_path / f"remote_ai_jobs_{token}.xlsx"
 
     try:
         _write_formatted_excel(sheets, file_path)
         return str(file_path)
     except PermissionError:
         # Almost always means the file from an earlier run is still open
-        # in Excel, which locks it for writing. Losing a completed search
-        # to that would be wasteful, so fall back to a suffixed filename
-        # and tell the user what happened.
+        # in Excel, which locks it for writing (a desktop-use case; the
+        # run_token above already prevents the separate silent-overwrite
+        # case on a server). Losing a completed search to that would be
+        # wasteful, so fall back to a suffixed filename and say why.
         for attempt in range(2, 12):
-            alt_path = out_path / f"remote_ai_jobs_{date.today().isoformat()}_{attempt}.xlsx"
+            alt_path = out_path / f"remote_ai_jobs_{token}_{attempt}.xlsx"
             try:
                 _write_formatted_excel(sheets, alt_path)
                 log.warning(
@@ -1259,7 +1281,7 @@ def export_to_excel(sheets, output_dir: str) -> str:
         raise
 
 
-def export_dropped_for_review(dropped_df: pd.DataFrame, output_dir: str) -> str | None:
+def export_dropped_for_review(dropped_df: pd.DataFrame, output_dir: str, run_token: str = None) -> str | None:
     """Write the rows the remote-safety filter removed to a small CSV so
     you can eyeball exactly what was excluded and why, instead of trusting
     the filter blindly. Only written when something was actually dropped."""
@@ -1268,7 +1290,7 @@ def export_dropped_for_review(dropped_df: pd.DataFrame, output_dir: str) -> str 
 
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    file_path = out_path / f"dropped_for_review_{date.today().isoformat()}.csv"
+    file_path = out_path / f"dropped_for_review_{run_token or new_run_token()}.csv"
 
     review_cols = {}
     for col, candidates in (
@@ -1551,6 +1573,33 @@ def shape_raw_companies_sheet(job_level_df: pd.DataFrame) -> pd.DataFrame:
     return _shape_sheet(job_level_df, RAW_COMPANY_COLUMNS, RAW_COMPANY_DEFAULTS)
 
 
+def build_search_summary_sheet(country_lock_report: dict) -> pd.DataFrame:
+    """The "Search Summary" sheet: one compact Metric/Value view of the
+    run, built directly from country_lock_report (the same dict the
+    console "COUNTRY LOCK / MAX_COMPANIES SUMMARY" prints and the API
+    returns), so the Excel sheet, the console output and the API status
+    payload can never drift out of sync with each other.
+    """
+    r = country_lock_report or {}
+    rows = [
+        ("Selected Country", r.get("selected_country", "")),
+        ("Target Companies", r.get("max_companies", "")),
+        ("Total Jobs", r.get("raw_jobs_total", 0)),
+        ("Raw Companies", r.get("raw_unique_companies", 0)),
+        ("Duplicates Removed", r.get("duplicate_postings_merged", 0)),
+        ("Country Mismatch", r.get("invalid_country_removed", 0)),
+        ("ICP Excluded (Low-Probability Buyers, kept & scored Low)", r.get("low_probability_buyers", 0)),
+        ("High Probability", r.get("high_probability", 0)),
+        ("Medium Probability", r.get("medium_probability", 0)),
+        ("Low Probability", r.get("low_probability", 0)),
+        ("Final Qualified Companies", r.get("final_companies_exported", 0)),
+        ("Queries Used", r.get("num_queries", 0)),
+        ("Pages Searched", r.get("pages_searched", 0)),
+        ("Execution Time", r.get("elapsed_formatted", "")),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Value"])
+
+
 def build_pipeline_summary_sheet(ctx, jobs_count: int, leads_count: int) -> pd.DataFrame:
     """Build the workbook's cumulative lead-search summary."""
     icp_stats = ctx.artifacts.get("icp_stats", {})
@@ -1610,7 +1659,7 @@ def _drop_internal(df: pd.DataFrame) -> pd.DataFrame:
     return df[[c for c in df.columns if not str(c).startswith("_")]]
 
 
-def export_excluded_companies(df: pd.DataFrame, output_dir: str) -> str | None:
+def export_excluded_companies(df: pd.DataFrame, output_dir: str, run_token: str = None) -> str | None:
     """Write excluded companies to their own CSV as well as the workbook
     sheet, so the audit trail survives outside Excel."""
     if df is None or df.empty:
@@ -1618,7 +1667,8 @@ def export_excluded_companies(df: pd.DataFrame, output_dir: str) -> str | None:
 
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    file_path = out_path / f"excluded_companies_{date.today().isoformat()}.csv"
+    token = run_token or new_run_token()
+    file_path = out_path / f"excluded_companies_{token}.csv"
     _drop_internal(df).to_csv(file_path, index=False)
     return str(file_path)
 
@@ -1802,6 +1852,10 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     start_time = time.monotonic()
     search_timeout = config.get("search_timeout_seconds", 1800)
     deadline = start_time + search_timeout
+
+    # One token for every file this run exports - see new_run_token's
+    # docstring for the same-day filename collision this prevents.
+    run_token = new_run_token()
 
     # Fresh source cache for every run while still avoiding repeated feed
     # downloads inside the same run (important for Europe and fallback).
@@ -2001,57 +2055,17 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
     # are all present; none are discarded.
     qualified_companies_sheet = shape_qualified_companies_sheet(ctx.data)
 
-    sheets = {
-        "Qualified Leads": leads_sheet,
-        "Qualified Companies": qualified_companies_sheet,
-        "Raw Companies": raw_companies_sheet,
-        "All Company Signals": shape_lead_sheet(all_signals),
-        "Excluded Companies": _drop_internal(excluded)
-        if excluded is not None and not excluded.empty
-        else pd.DataFrame({"Note": ["No companies were excluded in this run."]}),
-        "Pipeline Summary": build_pipeline_summary_sheet(
-            ctx, len(jobs_sheet), len(leads_sheet)
-        ),
-        "Remote Jobs": jobs_sheet,
-    }
-
-    output_path = export_to_excel(sheets, config["output_dir"])
-
-    excluded_path = None
-    if lead_config["save_excluded_companies"]:
-        excluded_path = export_excluded_companies(excluded, config["output_dir"])
-
-    # Export/audit metrics are based on exactly the rows that were written.
-    summary["dedup_counts"] = ctx.artifacts.get(
-        "job_dedup_counts",
-        {"by_url": 0, "by_fallback_key": 0, "by_title_company": 0},
-    )
-    capped_rows = job_level.head(config["target_total_jobs"])
-    if "_region" in job_level.columns:
-        capped = capped_rows["_region"].tolist()
-    else:
-        capped = []
-    counts = {}
-    for region in capped:
-        counts[region] = counts.get(region, 0) + 1
-    summary["export_region_counts"] = counts
-
-    keyword_counts_export = {k: 0 for k in expansion.get("keywords", [])}
-    if "search_keyword" in capped_rows.columns:
-        for value in capped_rows["search_keyword"]:
-            keyword_counts_export[value] = keyword_counts_export.get(value, 0) + 1
-    summary["keyword_counts"] = keyword_counts_export
-
+    # Country-lock / MAX_COMPANIES summary (requirements 4 and 11): one
+    # consolidated report of what was fetched, filtered, and exported for
+    # the selected country, built from the same artifacts as everything
+    # else above rather than a separate tracking mechanism. Computed here
+    # (before `sheets`) so it can also become the "Search Summary" sheet.
     dedup_stats = ctx.artifacts.get("company_dedup_stats", {})
     icp_stats = ctx.artifacts.get("icp_stats", {})
     contact_stats = ctx.artifacts.get("contact_stats", {})
     selection = ctx.artifacts.get("selection_stats", {})
     buyer_counts = selection.get("buyer_probability_counts", {})
 
-    # Country-lock / MAX_COMPANIES summary (requirements 4 and 11): one
-    # consolidated report of what was fetched, filtered, and exported for
-    # the selected country, built from the same artifacts as everything
-    # else above rather than a separate tracking mechanism.
     search_totals = _sum_search_stats(summary.get("region_stats", {}))
     final_count = len(leads_sheet)
     # "Duplicates removed" = raw postings collected minus the job-level
@@ -2091,6 +2105,48 @@ def execute_pipeline(user_input: dict, config: dict, lead_config: dict,
         "search_timeout_seconds": summary.get("search_timeout_seconds", search_timeout),
     }
     summary["country_lock_report"] = country_lock_report
+
+    sheets = {
+        "Qualified Leads": leads_sheet,
+        "Qualified Companies": qualified_companies_sheet,
+        "Raw Companies": raw_companies_sheet,
+        "Search Summary": build_search_summary_sheet(country_lock_report),
+        "All Company Signals": shape_lead_sheet(all_signals),
+        "Excluded Companies": _drop_internal(excluded)
+        if excluded is not None and not excluded.empty
+        else pd.DataFrame({"Note": ["No companies were excluded in this run."]}),
+        "Pipeline Summary": build_pipeline_summary_sheet(
+            ctx, len(jobs_sheet), len(leads_sheet)
+        ),
+        "Remote Jobs": jobs_sheet,
+    }
+
+    output_path = export_to_excel(sheets, config["output_dir"], run_token)
+
+    excluded_path = None
+    if lead_config["save_excluded_companies"]:
+        excluded_path = export_excluded_companies(excluded, config["output_dir"], run_token)
+
+    # Export/audit metrics are based on exactly the rows that were written.
+    summary["dedup_counts"] = ctx.artifacts.get(
+        "job_dedup_counts",
+        {"by_url": 0, "by_fallback_key": 0, "by_title_company": 0},
+    )
+    capped_rows = job_level.head(config["target_total_jobs"])
+    if "_region" in job_level.columns:
+        capped = capped_rows["_region"].tolist()
+    else:
+        capped = []
+    counts = {}
+    for region in capped:
+        counts[region] = counts.get(region, 0) + 1
+    summary["export_region_counts"] = counts
+
+    keyword_counts_export = {k: 0 for k in expansion.get("keywords", [])}
+    if "search_keyword" in capped_rows.columns:
+        for value in capped_rows["search_keyword"]:
+            keyword_counts_export[value] = keyword_counts_export.get(value, 0) + 1
+    summary["keyword_counts"] = keyword_counts_export
 
     if progress_callback:
         try:
